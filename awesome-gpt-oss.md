@@ -10,6 +10,7 @@ This is a list of guides and resources to help you get started with the gpt-oss 
   - [Cloud](#cloud)
 - [Examples / Tutorials](#examples--tutorials)
 - [Tools](#tools)
+- [Training](#training)
 
 ## Inference
 
@@ -71,6 +72,12 @@ This is a list of guides and resources to help you get started with the gpt-oss 
 
 - [Example `python` tool for gpt-oss](./gpt_oss/tools/python_docker/)
 - [Example `browser` tool for gpt-oss](./gpt_oss/tools/simple_browser/)
+
+## Training
+
+- [Hugging Face TRL examples](https://github.com/huggingface/gpt-oss-recipes)
+- [LlamaFactory examples](https://llamafactory.readthedocs.io/en/latest/advanced/best_practice/gpt-oss.html)
+- [Unsloth examples](https://docs.unsloth.ai/basics/gpt-oss-how-to-run-and-fine-tune)
 
 ## Contributing
 
