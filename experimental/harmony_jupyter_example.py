@@ -6,12 +6,12 @@ import json
 import sys
 import threading
 import gc
+import time
 from collections.abc import Iterable
 from datetime import date
 
 import torch
-from gpt_oss.tools.simple_browser import SimpleBrowserTool, ExaBackend
-from gpt_oss.tools.python_docker.docker_tool import PythonTool
+from jupyter_client import KernelManager
 from openai_harmony import (
     Conversation,
     DeveloperContent,
@@ -24,6 +24,7 @@ from openai_harmony import (
     load_harmony_encoding,
 )
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from gpt_oss.tools.simple_browser import SimpleBrowserTool, ExaBackend
 
 # =========================
 # 0) 模型与编码
@@ -36,47 +37,6 @@ model = None
 encoding = None
 browser_tool = None
 python_tool = None
-
-def setup_runtime(_model_id: str | None = None) -> None:
-    """惰性初始化分词器、模型、编码与工具（Browser/Python）。"""
-    global tokenizer, model, encoding, browser_tool, python_tool, model_id
-    # 允许通过函数参数或环境变量覆盖模型
-    if _model_id:
-        model_id = _model_id
-
-    # 分词器
-    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
-
-    # —— 注册 Harmony 特殊 token（若缺失）——
-    _SPECIALS = ["<|return|>", "<|call|>"]
-    to_add = [t for t in _SPECIALS if tokenizer.convert_tokens_to_ids(t) is None]
-    if to_add:
-        tokenizer.add_special_tokens({"additional_special_tokens": to_add})
-
-    # 模型（按环境选择设备）
-    device_map = "cuda"
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        device_map=device_map,
-        torch_dtype="auto",
-    )
-    if to_add:
-        try:
-            model.resize_token_embeddings(len(tokenizer))
-        except Exception:
-            pass
-
-    # 编码
-    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
-
-    # 工具（Browser / Python）
-    backend = ExaBackend(source="web")  # 需设置 EXA_API_KEY
-    browser_tool = SimpleBrowserTool(backend=backend)
-    python_tool = PythonTool()
-
-    # 写回全局
-    globals()["browser_tool"] = browser_tool
-    globals()["python_tool"] = python_tool
 
 # ==== Debug helpers (把 token ids 还原为原始文本，并打印 lcp 区段) ====
 def _decode_tokens(ids: list[int]) -> str:
@@ -124,6 +84,169 @@ def _release_cuda():
 # =========================
 # 1) 工具（Python / Browser）（安全位留空供加固）
 # =========================
+# from gpt_oss.tools.python_docker.docker_tool import PythonTool
+
+
+def _content_to_code_str(msg) -> str:
+    """从 Harmony Message 中稳妥抽出代码字符串：兼容 JSON 包装与 code/text 片段。"""
+    c = getattr(msg, "content", "")
+    # 情况1：纯字符串（可能是 {"code": "..."} 的JSON文本）
+    if isinstance(c, str):
+        try:
+            obj = json.loads(c)
+            if isinstance(obj, dict) and isinstance(obj.get("code"), str):
+                return obj["code"]
+        except Exception:
+            return c
+    # 情况2：内容片段列表（模型常用 to=python code 的形式）
+    try:
+        if isinstance(c, Iterable) and not isinstance(c, (bytes, bytearray)):
+            parts = []
+            for p in c:
+                if hasattr(p, "code") and isinstance(p.code, str):
+                    parts.append(p.code)
+                elif hasattr(p, "text") and isinstance(p.text, str):
+                    parts.append(p.text)
+            if parts:
+                return "\n".join(parts)
+    except Exception:
+        pass
+    # 兜底
+    t = getattr(c, "text", None)
+    return t if isinstance(t, str) else str(c)
+
+class JupyterPythonTool:
+    """
+    使用本机 Jupyter kernel 作为 GPT-OSS 的 python 工具后端（有状态）。
+    - 工具名固定为 'python'
+    - 单实例维持一个 kernel，会话内多次调用共享变量/文件
+    """
+    name = "python"
+
+    def __init__(self, kernel_name: str = "python3", timeout_s: float = 120.0):
+        self.timeout_s = timeout_s
+        self.km = KernelManager(kernel_name=kernel_name)
+        self.km.start_kernel()
+        self.kc = self.km.client()          # or .blocking_client()
+        self.kc.start_channels()
+
+    def shutdown(self):
+        try:
+            self.kc.stop_channels()
+        finally:
+            try:
+                self.km.shutdown_kernel(now=True)
+            except Exception:
+                pass
+
+    def _run_code(self, code: str):
+        msg_id = self.kc.execute(code, allow_stdin=False, stop_on_error=True)
+        t0 = time.time()
+        stdout_parts, stderr_parts, displays, last_text_result = [], [], [], None
+
+        while True:
+            if time.time() - t0 > self.timeout_s:
+                stderr_parts.append(f"\n[Timeout] execution exceeded {self.timeout_s}s")
+                break
+            try:
+                msg = self.kc.get_iopub_msg(timeout=0.2)
+            except Exception:
+                continue
+
+            mtype = msg["header"]["msg_type"]
+            content = msg.get("content", {})
+
+            if mtype == "stream":
+                if content.get("name") == "stdout":
+                    stdout_parts.append(content.get("text", ""))
+                elif content.get("name") == "stderr":
+                    stderr_parts.append(content.get("text", ""))
+            elif mtype in ("execute_result", "display_data"):
+                data = content.get("data", {})
+                if "text/plain" in data:
+                    last_text_result = data["text/plain"]
+                if "image/png" in data:
+                    displays.append({"mime": "image/png", "data": data["image/png"]})
+                if "text/html" in data:
+                    displays.append({"mime": "text/html", "data": data["text/html"]})
+            elif mtype == "error":
+                tb = "\n".join(content.get("traceback", []))
+                stderr_parts.append(tb or f"{content.get('ename','')}: {content.get('evalue','')}")
+            elif mtype == "status" and content.get("execution_state") == "idle":
+                break
+
+        return {
+            "stdout": "".join(stdout_parts),
+            "stderr": "".join(stderr_parts),
+            "result": last_text_result,
+            "displays": displays,   # e.g. [{"mime":"image/png","data":"...base64..."}]
+            "files": [],
+        }
+
+    def process(self, py_call_msg: Message):
+        # 关键：把 Message 内容抽成 str，再执行
+        code = _content_to_code_str(py_call_msg)
+
+        payload = self._run_code(code)
+
+        # ✅ 正确的“工具回传”形状：作者=具体工具名；收件人=assistant；走 commentary
+        tool_msg = (
+            Message.from_author_and_content(
+                Author.new(Role.TOOL, "python"),
+                json.dumps(payload)
+            )
+            .with_channel("commentary")
+            .with_recipient("assistant")
+            .with_content_type("json")
+        )
+        return [tool_msg]
+
+def setup_runtime(_model_id: str | None = None) -> None:
+    """惰性初始化分词器、模型、编码与工具。
+
+    放入 main() 调用，避免 import 时执行重活；也便于后续
+    通过参数覆盖 model_id。
+    """
+    global tokenizer, model, encoding, browser_tool, python_tool, model_id
+    # 允许通过函数参数或环境变量覆盖模型
+    if _model_id:
+        model_id = _model_id
+
+    # 分词器
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+
+    # —— 注册 Harmony 特殊 token（若缺失）——
+    _SPECIALS = ["<|return|>", "<|call|>"]
+    to_add = [t for t in _SPECIALS if tokenizer.convert_tokens_to_ids(t) is None]
+    if to_add:
+        tokenizer.add_special_tokens({"additional_special_tokens": to_add})
+
+    # 模型（按环境选择设备）
+    device_map = "cuda"
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        device_map=device_map,
+        torch_dtype="auto",
+    )
+
+    # 若刚注册过特殊 token，这里补一次 resize（失败忽略）
+    if to_add:
+        try:
+            model.resize_token_embeddings(len(tokenizer))
+        except Exception:
+            pass
+
+    # 编码
+    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+
+    # 工具（Browser / Python）
+    backend = ExaBackend(source="web")  # 需设置 EXA_API_KEY
+    browser_tool = SimpleBrowserTool(backend=backend)
+    python_tool = JupyterPythonTool()
+
+    # 写回全局（避免局部变量遮蔽）
+    globals()["browser_tool"] = browser_tool
+    globals()["python_tool"] = python_tool
 
 # =========================
 # 2) System / Developer / User
@@ -135,13 +258,14 @@ system_msg = (
     .with_conversation_start_date(str(date.today()))
     .with_reasoning_effort(ReasoningEffort.MEDIUM)
     .with_required_channels(["analysis", "commentary", "final"])
-    .with_python_tool()  # 声明可用 Python 工具命名空间
-    .with_browser_tool() # 声明可用 Browser 工具命名空间
+    .with_python_tool()  # 使用内置的（训练时）python 工具定义 = 有状态 Jupyter 约定
+    .with_browser_tool()
 )
 
 developer_msg = (
     DeveloperContent.new().with_instructions(
-        "始终在一次 Python 工具调用中完成计算并使用 print 输出结果"
+        """
+        """
     )
 )
 
@@ -434,6 +558,42 @@ def _truncate_past_key_values(past_key_values, length: int):
 # 5) 工具循环
 # =========================
 MAX_STEPS = 32
+
+
+def _assert_tools_named(sysmsg):
+    tools_ns = getattr(sysmsg, "tools", None)
+    assert tools_ns, "No tools declared on system_msg"
+
+    bad_ns = []
+    bad_funcs = []
+    summary = []
+
+    for key, spec in tools_ns.items():
+        # spec 是 Pydantic 模型（ToolNamespaceConfig）
+        name = getattr(spec, "name", None)
+        if not name and hasattr(spec, "model_dump"):
+            name = spec.model_dump().get("name")
+
+        # 记录概况
+        summary.append((key, name, type(spec).__name__))
+
+        if not name or not str(name).strip():
+            bad_ns.append(key)
+
+        # 逐个检查该命名空间下的函数（如 browser.search/open/find）
+        funcs = getattr(spec, "tools", []) or []
+        for i, f in enumerate(funcs):
+            fname = getattr(f, "name", None)
+            if not fname and hasattr(f, "model_dump"):
+                fname = f.model_dump().get("name")
+            if not fname or not str(fname).strip():
+                bad_funcs.append(f"{key}[{i}]")
+
+    print("tool namespaces:", summary)
+    assert not bad_ns, f"Unnamed tool namespaces: {bad_ns}"
+    assert not bad_funcs, f"Unnamed functions in namespaces: {bad_funcs}"
+
+# _assert_tools_named(system_msg)
 
 def main() -> None:
     # 在执行前初始化运行时（模型、分词器、工具）
