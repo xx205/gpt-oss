@@ -9,7 +9,6 @@ import threading
 import gc
 import time
 import os
-
 from collections.abc import Iterable
 from datetime import date
 
@@ -51,7 +50,6 @@ encoding = None
 browser_tool = None
 python_tool = None
 _pkv_debug_printed = False
-
 
 # ==== Debug helpers (把 token ids 还原为原始文本，并打印 lcp 区段) ====
 def _decode_tokens(ids: list[int]) -> str:
@@ -714,7 +712,6 @@ def _truncate_past_key_values(past_key_values, length: int):
     compact = _compact_dynamic_cache(past_key_values, length)
     if compact is not None:
         return compact
-
     return None
 
 def _rebuild_pkv_for_prefix(input_token_ids: list[int], upto: int):
@@ -1135,11 +1132,15 @@ def main() -> None:
                 # except Exception:
                 #     print(f"[KV] after tool: seq_len={after_len}, processed_tokens={processed_tokens}, gpu=({_gpu_mem_stats()})")
             else:
-                # 未知工具：回注错误消息，防止死循环
+                # 未知工具：按 Harmony 规范回填一条错误消息，防止死循环
                 messages.append(
-                    Message.from_role_and_content(
-                        Role.TOOL, json.dumps({"error": f"tool {name} not available"})
-                    ).with_channel("commentary").with_recipient(name).with_content_type("json")
+                    Message.from_author_and_content(
+                        Author.new(Role.TOOL, name),
+                        json.dumps({"error": f"Unknown tool '{name}'."})
+                    )
+                    .with_channel("commentary")
+                    .with_recipient("assistant")
+                    .with_content_type("json")
                 )
 
             continue
