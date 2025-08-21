@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# pip install -U torch>=2.8.0 triton>=3.4.0 transformers>=4.55.2 kernels accelerate openai-harmony gpt-oss jupyter_client ipykernel pyzmq
+# pip install -U "torch>=2.8.0" "triton>=3.4.0" "transformers>=4.55.2" kernels accelerate openai-harmony gpt-oss jupyter_client ipykernel pyzmq
 
 import asyncio
 import inspect
