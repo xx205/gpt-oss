@@ -544,7 +544,7 @@ def coerce_python_call_message(last_msg: Message) -> Message:
     """
     把“模型发起的工具调用”规范化为 PythonTool 可执行的格式。
 
-    模型可能传回 JSON 如 {"code": "print(2+2)"},
+    模型可能传回 JSON 如 {"code": "print(2+2)"}，
     而 PythonTool 期望是纯 Python 源码。这里解析 JSON，
     并返回只包含代码字符串的消息。
     """
@@ -712,9 +712,7 @@ def _truncate_past_key_values(past_key_values, length: int):
     compact = _compact_dynamic_cache(past_key_values, length)
     if compact is not None:
         return compact
-
     return None
-
 
 def _rebuild_pkv_for_prefix(input_token_ids: list[int], upto: int):
     """Rebuild a fresh KV cache for the given prefix [0:upto] using chunked prefill.
@@ -1160,4 +1158,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
