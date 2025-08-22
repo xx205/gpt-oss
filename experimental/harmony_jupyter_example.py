@@ -9,6 +9,7 @@ import threading
 import gc
 import time
 import os
+import codecs
 from collections.abc import Iterable
 from datetime import date
 
@@ -437,6 +438,9 @@ def generate_once(
         aggressive = os.getenv("HARMONY_AGGRESSIVE_EMPTY_CACHE", "1").lower() in {"1","true","yes"}
         release_every = int(os.getenv("HARMONY_DECODE_RELEASE_EVERY", "256"))
         step = 0
+        # Byte-level incremental decoder ensures partial UTF-8 sequences are
+        # buffered until the remaining bytes arrive in later tokens.
+        utf8_decoder = codecs.getincrementaldecoder("utf-8")()
         for _ in range(max_new_tokens):
             inp = _to_dev([cur_token])
             outputs = model(input_ids=inp, past_key_values=past_key_values, use_cache=True, return_dict=True)
@@ -445,12 +449,15 @@ def generate_once(
             next_id = _softmax_sample_top_p(logits, temperature=temperature, top_p=top_p)
             out_ids.append(next_id)
 
-            # stream token
-            try:
-                sys.stdout.write(tokenizer.decode([next_id], skip_special_tokens=False, clean_up_tokenization_spaces=False))
-                sys.stdout.flush()
-            except Exception:
-                pass
+            if stream:
+                token_bytes = bytes(encoding._inner.decode_bytes([next_id]))
+                # Incomplete UTF-8 byte sequences are buffered internally by the
+                # incremental decoder, so "half" characters will be combined
+                # with bytes from subsequent tokens before any text is emitted.
+                decoded = utf8_decoder.decode(token_bytes, final=False)
+                if decoded:
+                    sys.stdout.write(decoded)
+                    sys.stdout.flush()
 
             if eids and next_id in eids:
                 break
@@ -463,6 +470,16 @@ def generate_once(
                     torch.cuda.ipc_collect()
                 except Exception:
                     torch.cuda.empty_cache()
+
+        # Flush any residual bytes that formed an incomplete UTF-8 sequence.
+        if stream:
+            try:
+                final_decoded = utf8_decoder.decode(b"", final=True)
+                if final_decoded:
+                    sys.stdout.write(final_decoded)
+                    sys.stdout.flush()
+            except Exception:
+                pass
 
     # 同步 + 清理缓存
     if torch.cuda.is_available():
