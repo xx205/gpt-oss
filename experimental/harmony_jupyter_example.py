@@ -89,20 +89,15 @@ def _show_lcp_debug(prev_ids: list[int], cur_ids: list[int], lcp_len: int, *, ta
 
 # ---- token byte helpers -------------------------------------------------
 def _build_token_byte_decoder() -> Callable[[int], bytes]:
-    """Construct a fast token-id → raw-bytes decoder using public APIs."""
+    """Construct a fast token-id → raw-bytes decoder using the private API."""
     assert encoding is not None, "Encoding not initialized. Call setup_runtime() first."
 
-    tokenizer_api = getattr(encoding, "tokenizer", None)
-    if callable(tokenizer_api):
-        bpe = tokenizer_api()
-        decode_bytes = getattr(bpe, "decode_bytes", None)
-        if callable(decode_bytes):
-            return lambda token_id: bytes(decode_bytes((token_id,)))
+    inner = getattr(encoding, "_inner", None)
+    if inner is None or not hasattr(inner, "decode_bytes"):
+        raise AttributeError("encoding._inner.decode_bytes not available")
 
-    if hasattr(encoding, "decode_bytes"):
-        return lambda token_id: bytes(encoding.decode_bytes([token_id]))
-
-    raise AttributeError("encoding does not provide a public decode_bytes method")
+    decode_bytes = inner.decode_bytes
+    return lambda token_id: bytes(decode_bytes([token_id]))
 
 # ---- memory helpers: 丢引用后立刻回收 CUDA 缓存 ----
 def _release_cuda():
