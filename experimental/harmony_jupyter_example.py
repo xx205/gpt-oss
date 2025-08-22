@@ -10,7 +10,7 @@ import gc
 import time
 import os
 import codecs
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import date
 
 import torch
@@ -51,6 +51,8 @@ encoding = None
 browser_tool = None
 python_tool = None
 _pkv_debug_printed = False
+# Lazy-initialized callable converting a token id to its raw byte sequence
+_decode_token_bytes: Callable[[int], bytes] | None = None
 
 # ==== Debug helpers (把 token ids 还原为原始文本，并打印 lcp 区段) ====
 def _decode_tokens(ids: list[int]) -> str:
@@ -84,6 +86,23 @@ def _show_lcp_debug(prev_ids: list[int], cur_ids: list[int], lcp_len: int, *, ta
             pass
         print("  prev text:", repr(_decode_tokens(prev_tail_ids)))
         print("  curr text:", repr(_decode_tokens(cur_tail_ids)))
+
+# ---- token byte helpers -------------------------------------------------
+def _build_token_byte_decoder() -> Callable[[int], bytes]:
+    """Construct a fast token-id → raw-bytes decoder using public APIs."""
+    assert encoding is not None, "Encoding not initialized. Call setup_runtime() first."
+
+    tokenizer_api = getattr(encoding, "tokenizer", None)
+    if callable(tokenizer_api):
+        bpe = tokenizer_api()
+        decode_bytes = getattr(bpe, "decode_bytes", None)
+        if callable(decode_bytes):
+            return lambda token_id: bytes(decode_bytes((token_id,)))
+
+    if hasattr(encoding, "decode_bytes"):
+        return lambda token_id: bytes(encoding.decode_bytes([token_id]))
+
+    raise AttributeError("encoding does not provide a public decode_bytes method")
 
 # ---- memory helpers: 丢引用后立刻回收 CUDA 缓存 ----
 def _release_cuda():
@@ -252,6 +271,10 @@ def setup_runtime(_model_id: str | None = None) -> None:
 
     # 编码
     encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+
+    # 单次确定 token byte 解码器，后续生成无需重复判定
+    global _decode_token_bytes
+    _decode_token_bytes = _build_token_byte_decoder()
 
     # 工具（Browser / Python）
     backend = ExaBackend(source="web")  # 需设置 EXA_API_KEY
@@ -441,6 +464,7 @@ def generate_once(
         # Byte-level incremental decoder ensures partial UTF-8 sequences are
         # buffered until the remaining bytes arrive in later tokens.
         utf8_decoder = codecs.getincrementaldecoder("utf-8")()
+        assert _decode_token_bytes is not None, "Token byte decoder not initialized. Call setup_runtime() first."
         for _ in range(max_new_tokens):
             inp = _to_dev([cur_token])
             outputs = model(input_ids=inp, past_key_values=past_key_values, use_cache=True, return_dict=True)
@@ -450,7 +474,7 @@ def generate_once(
             out_ids.append(next_id)
 
             if stream:
-                token_bytes = bytes(encoding._inner.decode_bytes([next_id]))
+                token_bytes = _decode_token_bytes(next_id)
                 # Incomplete UTF-8 byte sequences are buffered internally by the
                 # incremental decoder, so "half" characters will be combined
                 # with bytes from subsequent tokens before any text is emitted.
