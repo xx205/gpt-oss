@@ -51,6 +51,8 @@ encoding = None
 browser_tool = None
 python_tool = None
 _pkv_debug_printed = False
+# Lazy-initialized callable converting a token id to its raw byte sequence
+_decode_token_bytes: Callable[[int], bytes] | None = None
 
 # ==== Debug helpers (把 token ids 还原为原始文本，并打印 lcp 区段) ====
 def _decode_tokens(ids: list[int]) -> str:
@@ -84,6 +86,18 @@ def _show_lcp_debug(prev_ids: list[int], cur_ids: list[int], lcp_len: int, *, ta
             pass
         print("  prev text:", repr(_decode_tokens(prev_tail_ids)))
         print("  curr text:", repr(_decode_tokens(cur_tail_ids)))
+
+# ---- token byte helpers -------------------------------------------------
+def _build_token_byte_decoder() -> Callable[[int], bytes]:
+    """Construct a fast token-id → raw-bytes decoder using the private API."""
+    assert encoding is not None, "Encoding not initialized. Call setup_runtime() first."
+
+    inner = getattr(encoding, "_inner", None)
+    if inner is None or not hasattr(inner, "decode_bytes"):
+        raise AttributeError("encoding._inner.decode_bytes not available")
+
+    decode_bytes = inner.decode_bytes
+    return lambda token_id: bytes(decode_bytes([token_id]))
 
 # ---- memory helpers: 丢引用后立刻回收 CUDA 缓存 ----
 def _release_cuda():
@@ -252,6 +266,10 @@ def setup_runtime(_model_id: str | None = None) -> None:
 
     # 编码
     encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+
+    # 单次确定 token byte 解码器，后续生成无需重复判定
+    global _decode_token_bytes
+    _decode_token_bytes = _build_token_byte_decoder()
 
     # 工具（Browser / Python）
     backend = ExaBackend(source="web")  # 需设置 EXA_API_KEY
