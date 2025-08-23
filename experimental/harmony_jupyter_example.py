@@ -10,7 +10,7 @@ import gc
 import time
 import os
 import codecs
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from datetime import date
 
 import torch
@@ -418,7 +418,7 @@ def generate_once(
         # extend PKV with any new input ids except the last token
         if processed_tokens < prefill_upto:
             # feed in chunks to reduce peak
-            chunk = int(os.getenv("HARMONY_PREFILL_CHUNK", "1024"))
+            chunk = int(os.getenv("HARMONY_PREFILL_CHUNK", "32"))
             aggressive = os.getenv("HARMONY_AGGRESSIVE_EMPTY_CACHE", "1").lower() in {"1","true","yes"}
             i = processed_tokens
             while i < prefill_upto:
@@ -457,9 +457,10 @@ def generate_once(
         release_every = int(os.getenv("HARMONY_DECODE_RELEASE_EVERY", "256"))
         step = 0
         # Byte-level incremental decoder ensures partial UTF-8 sequences are
-        # buffered until the remaining bytes arrive in later tokens.
-        utf8_decoder = codecs.getincrementaldecoder("utf-8")()
-        assert _decode_token_bytes is not None, "Token byte decoder not initialized. Call setup_runtime() first."
+        # buffered until the remaining bytes arrive in later tokens. Any bytes
+        # that do not form valid UTF-8 are silently dropped to avoid streaming
+        # errors.
+        utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
         for _ in range(max_new_tokens):
             inp = _to_dev([cur_token])
             outputs = model(input_ids=inp, past_key_values=past_key_values, use_cache=True, return_dict=True)
@@ -469,7 +470,7 @@ def generate_once(
             out_ids.append(next_id)
 
             if stream:
-                token_bytes = _decode_token_bytes(next_id)
+                token_bytes = bytes(encoding._inner.decode_bytes([next_id]))
                 # Incomplete UTF-8 byte sequences are buffered internally by the
                 # incremental decoder, so "half" characters will be combined
                 # with bytes from subsequent tokens before any text is emitted.
@@ -492,13 +493,10 @@ def generate_once(
 
         # Flush any residual bytes that formed an incomplete UTF-8 sequence.
         if stream:
-            try:
-                final_decoded = utf8_decoder.decode(b"", final=True)
-                if final_decoded:
-                    sys.stdout.write(final_decoded)
-                    sys.stdout.flush()
-            except Exception:
-                pass
+            final_decoded = utf8_decoder.decode(b"", final=True)
+            if final_decoded:
+                sys.stdout.write(final_decoded)
+                sys.stdout.flush()
 
     # 同步 + 清理缓存
     if torch.cuda.is_available():
@@ -614,94 +612,90 @@ def _longest_common_prefix(a: list[int], b: list[int]) -> int:
 
 
 def _truncate_past_key_values(past_key_values, length: int):
-    """返回一份被“物理紧凑化”的 KV（新对象）。失败则返回 None。"""
+    """返回一份“逻辑上被截断到 length”的 KV。
+    目标：不做任何 .clone() / .contiguous()，避免临时双份 KV 引发峰值。
+    若底层支持 .truncate(L)，直接在原对象上逻辑截断并返回同一对象；
+    否则构造“仅由切片视图组成”的新结构（不额外分配大块显存）。
+    失败返回 None（由调用方决定是否重建或维持原状）。
+    """
     if past_key_values is None:
         return None
+    L = int(length)
+    if L <= 0:
+        # 空前缀：统一返回 None
+        return None
 
-    # 1) DynamicCache 兼容：尽量抽取出底层 K/V 并小拷贝
-    def _compact_dynamic_cache(pkv, L):
-        # 让逻辑长度先生效（万一模型内部用到）
-        try:
-            if hasattr(pkv, "truncate"):
-                pkv.truncate(L)
-                # 若已支持逻辑截断，但无法物理提取底层张量，也可以直接返回 pkv 以便继续复用
-                # 先尝试物理紧凑化，失败再回退
-        except Exception:
-            pass
+    # 0) 优先：动态缓存对象若提供 truncate()，只做逻辑截断（零拷贝）
+    try:
+        if hasattr(past_key_values, "truncate"):
+            past_key_values.truncate(L)
+            return past_key_values
+    except Exception:
+        pass
 
-        # 0) DynamicCache layers[].keys/values → 构建新的 DynamicCache
+    # 1) 传统 list/tuple 形式：[(k, v), ...] —— 只做切片视图，不 clone
+    if isinstance(past_key_values, (list, tuple)) and past_key_values:
+        new_list = []
+        for layer in past_key_values:
+            if not (isinstance(layer, (list, tuple)) and len(layer) == 2):
+                return None
+            k, v = layer
+            if not (torch.is_tensor(k) and torch.is_tensor(v)):
+                return None
+            # 只切片，不 contiguous、不 clone；保持视图，零分配
+            new_k = k[..., :L, :]
+            new_v = v[..., :L, :]
+            new_list.append((new_k, new_v))
+        return new_list
+
+    # 2) HF DynamicCache 系列：用视图切片重建一个“瘦身”后的缓存对象
+    def _build_dynamic_from_layers(cache_obj, layers_attr: str):
         try:
-            layers = getattr(pkv, "layers", None)
+            layers = getattr(cache_obj, layers_attr, None)
             if _HF_DynamicCache is not None and isinstance(layers, (list, tuple)) and layers:
                 new_cache = _HF_DynamicCache()
-                ok = True
                 for idx, layer in enumerate(layers):
                     k = getattr(layer, "keys", None)
                     v = getattr(layer, "values", None)
                     if torch.is_tensor(k) and torch.is_tensor(v):
-                        new_k = k[..., :L, :].contiguous().clone()
-                        new_v = v[..., :L, :].contiguous().clone()
+                        new_k = k[..., :L, :]  # 视图
+                        new_v = v[..., :L, :]  # 视图
                         new_cache.update(new_k, new_v, idx)
                     else:
-                        ok = False
-                        break
-                if ok:
-                    return new_cache
+                        return None
+                return new_cache
         except Exception:
-            pass
+            return None
+        return None
 
-        # 顶层 key_cache/value_cache 直接切片（可能已弃用，但尽量利用）
-        try:
-            kc = getattr(pkv, "key_cache", None)
-            vc = getattr(pkv, "value_cache", None)
-            if _HF_DynamicCache is not None and isinstance(kc, (list, tuple)) and isinstance(vc, (list, tuple)) and len(kc) == len(vc) and kc:
-                new_cache = _HF_DynamicCache()
-                ok = True
-                for idx, (k, v) in enumerate(zip(kc, vc)):
-                    if torch.is_tensor(k) and torch.is_tensor(v):
-                        new_k = k[..., :L, :].contiguous().clone()
-                        new_v = v[..., :L, :].contiguous().clone()
-                        new_cache.update(new_k, new_v, idx)
-                    else:
-                        ok = False
-                        break
-                if ok:
-                    return new_cache
-        except Exception:
-            pass
+    # 2a) 优先从 layers[].keys/values 提取
+    cache2 = _build_dynamic_from_layers(past_key_values, "layers")
+    if cache2 is not None:
+        return cache2
 
-        # 通过 to_legacy_cache() 转换为旧格式再切片
-        try:
-            if hasattr(pkv, "to_legacy_cache"):
-                legacy = pkv.to_legacy_cache()
-                if _HF_DynamicCache is not None and isinstance(legacy, (list, tuple)) and legacy:
-                    new_cache = _HF_DynamicCache()
-                    ok = True
-                    for idx, layer in enumerate(legacy):
-                        if isinstance(layer, (list, tuple)) and len(layer) == 2:
-                            k, v = layer
-                            if torch.is_tensor(k) and torch.is_tensor(v):
-                                new_k = k[..., :L, :].contiguous().clone()
-                                new_v = v[..., :L, :].contiguous().clone()
-                                new_cache.update(new_k, new_v, idx)
-                            else:
-                                ok = False
-                                break
-                        else:
-                            ok = False
-                            break
-                    if ok:
-                        return new_cache
-        except Exception:
-            pass
+    # 2b) 顶层 key_cache/value_cache（老接口）
+    try:
+        kc = getattr(past_key_values, "key_cache", None)
+        vc = getattr(past_key_values, "value_cache", None)
+        if _HF_DynamicCache is not None and isinstance(kc, (list, tuple)) and isinstance(vc, (list, tuple)) and kc and len(kc) == len(vc):
+            new_cache = _HF_DynamicCache()
+            for idx, (k, v) in enumerate(zip(kc, vc)):
+                if not (torch.is_tensor(k) and torch.is_tensor(v)):
+                    return None
+                new_k = k[..., :L, :]
+                new_v = v[..., :L, :]
+                new_cache.update(new_k, new_v, idx)
+            return new_cache
+    except Exception:
+        pass
 
-        # 找到底层缓存并小拷贝为 list[(k,v)]
-        for attr in ("caches", "layers", "kv_cache", "key_value_caches"):
-            if hasattr(pkv, attr):
-                caches = getattr(pkv, attr)
+    # 2c) 其它命名（caches/kv_cache/key_value_caches），尽量返回 list[(k,v)] 视图
+    for attr in ("caches", "kv_cache", "key_value_caches"):
+        if hasattr(past_key_values, attr):
+            try:
+                caches = getattr(past_key_values, attr)
                 new_list = []
-                for layer in caches:
-                    # 兼容不同字段命名
+                for layer in caches or []:
                     k = (
                         getattr(layer, "key_cache", None)
                         or getattr(layer, "k_cache", None)
@@ -712,42 +706,37 @@ def _truncate_past_key_values(past_key_values, length: int):
                         or getattr(layer, "v_cache", None)
                         or getattr(layer, "v", None)
                     )
-                    # 若 layer 本身就是 (k,v) 形式
                     if (k is None or v is None) and isinstance(layer, (list, tuple)) and len(layer) == 2:
                         k, v = layer
-                    if torch.is_tensor(k) and torch.is_tensor(v):
-                        new_k = k[..., :L, :].contiguous().clone()
-                        new_v = v[..., :L, :].contiguous().clone()
-                        new_list.append((new_k, new_v))
-                    else:
+                    if not (torch.is_tensor(k) and torch.is_tensor(v)):
                         return None
-                return new_list
-        # 无法物理提取时，若已做过逻辑 truncate，则直接返回 pkv（继续复用，而非丢弃）
-        try:
-            if hasattr(pkv, "truncate"):
-                return pkv
-        except Exception:
-            pass
-        return None
+                    new_k = k[..., :L, :]
+                    new_v = v[..., :L, :]
+                    new_list.append((new_k, new_v))
+                return new_list if new_list else None
+            except Exception:
+                pass
 
-    # 2) 传统 list/tuple 形式：小拷贝
-    if isinstance(past_key_values, (list, tuple)):
-        new_list = []
-        for layer in past_key_values:
-            if not (isinstance(layer, (list, tuple)) and len(layer) == 2):
-                return None
-            k, v = layer
-            if not (torch.is_tensor(k) and torch.is_tensor(v)):
-                return None
-            new_k = k[..., :length, :].contiguous().clone()
-            new_v = v[..., :length, :].contiguous().clone()
-            new_list.append((new_k, new_v))
-        return new_list
+    # 2d) 退路：to_legacy_cache() 后再用视图组装 DynamicCache
+    try:
+        if hasattr(past_key_values, "to_legacy_cache"):
+            legacy = past_key_values.to_legacy_cache()
+            if _HF_DynamicCache is not None and isinstance(legacy, (list, tuple)) and legacy:
+                new_cache = _HF_DynamicCache()
+                for idx, layer in enumerate(legacy):
+                    if not (isinstance(layer, (list, tuple)) and len(layer) == 2):
+                        return None
+                    k, v = layer
+                    if not (torch.is_tensor(k) and torch.is_tensor(v)):
+                        return None
+                    new_k = k[..., :L, :]
+                    new_v = v[..., :L, :]
+                    new_cache.update(new_k, new_v, idx)
+                return new_cache
+    except Exception:
+        pass
 
-    # 3) DynamicCache 或其它结构：尝试紧凑化为 list[(k,v)]
-    compact = _compact_dynamic_cache(past_key_values, length)
-    if compact is not None:
-        return compact
+    # 实在没法“零拷贝瘦身”，宣告失败，由调用方决定是否重建或维持原状
     return None
 
 def _rebuild_pkv_for_prefix(input_token_ids: list[int], upto: int):
@@ -760,7 +749,7 @@ def _rebuild_pkv_for_prefix(input_token_ids: list[int], upto: int):
         return None
     import os
     pkv = None
-    chunk = int(os.getenv("HARMONY_PREFILL_CHUNK", "1024"))
+    chunk = int(os.getenv("HARMONY_PREFILL_CHUNK", "32"))
     aggressive = os.getenv("HARMONY_AGGRESSIVE_EMPTY_CACHE", "1").lower() in {"1","true","yes"}
     with torch.inference_mode():
         i = 0
@@ -790,7 +779,7 @@ def _extend_pkv_with_tokens(past_key_values, token_ids: list[int]):
     import os
     if not token_ids:
         return past_key_values
-    chunk = int(os.getenv("HARMONY_PREFILL_CHUNK", "1024"))
+    chunk = int(os.getenv("HARMONY_PREFILL_CHUNK", "32"))
     aggressive = os.getenv("HARMONY_AGGRESSIVE_EMPTY_CACHE", "0").lower() in {"1","true","yes"}
     with torch.inference_mode():
         i = 0
