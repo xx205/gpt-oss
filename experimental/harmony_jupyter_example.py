@@ -10,7 +10,7 @@ import gc
 import time
 import os
 import codecs
-from collections.abc import Iterable
+from collections.abc import Iterable, Callable
 from datetime import date
 
 import torch
