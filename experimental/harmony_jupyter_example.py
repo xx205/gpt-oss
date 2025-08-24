@@ -64,8 +64,8 @@ _decode_token_bytes: Callable[[int], bytes] | None = None
 @dataclass
 class RuntimeConfig:
     prefill_chunk: int = 32
-    aggressive_empty_cache: bool = False
-    decode_release_every: int = 256
+    aggressive_empty_cache: bool = True
+    decode_release_every: int = 128
     temperature: float = 1.0
     top_p: float = 1.0
     seed: int | None = None
@@ -113,8 +113,8 @@ def _load_config() -> RuntimeConfig:
 
     return RuntimeConfig(
         prefill_chunk=_get_int("HARMONY_PREFILL_CHUNK", 32),
-        aggressive_empty_cache=_get_bool("HARMONY_AGGRESSIVE_EMPTY_CACHE", False),
-        decode_release_every=_get_int("HARMONY_DECODE_RELEASE_EVERY", 256),
+        aggressive_empty_cache=_get_bool("HARMONY_AGGRESSIVE_EMPTY_CACHE", True),
+        decode_release_every=_get_int("HARMONY_DECODE_RELEASE_EVERY", 128),
         temperature=_get_float("HARMONY_TEMPERATURE", 1.0),
         top_p=_get_float("HARMONY_TOP_P", 1.0),
         seed=seed_val,
@@ -540,7 +540,7 @@ def generate_once(
         if processed_tokens < prefill_upto:
             # feed in chunks to reduce peak
             chunk = (cfg.prefill_chunk if cfg is not None else 32)
-            aggressive = bool(cfg.aggressive_empty_cache) if cfg is not None else False
+            aggressive = bool(cfg.aggressive_empty_cache) if cfg is not None else True
             i = processed_tokens
             while i < prefill_upto:
                 j = min(prefill_upto, i + chunk)
@@ -581,8 +581,8 @@ def generate_once(
         eids = _collect_eos_ids()
         temperature = (cfg.temperature if cfg is not None else 1.0)
         top_p = (cfg.top_p if cfg is not None else 1.0)
-        aggressive = bool(cfg.aggressive_empty_cache) if cfg is not None else False
-        release_every = (cfg.decode_release_every if cfg is not None else 256)
+        aggressive = bool(cfg.aggressive_empty_cache) if cfg is not None else True
+        release_every = (cfg.decode_release_every if cfg is not None else 128)
         step = 0
         # Byte-level incremental decoder ensures partial UTF-8 sequences are
         # buffered until the remaining bytes arrive in later tokens. Any bytes
@@ -888,7 +888,7 @@ def _rebuild_pkv_for_prefix(input_token_ids: list[int], upto: int):
         return None
     pkv = None
     chunk = (cfg.prefill_chunk if cfg is not None else 32)
-    aggressive = bool(cfg.aggressive_empty_cache) if cfg is not None else False
+    aggressive = bool(cfg.aggressive_empty_cache) if cfg is not None else True
     with torch.inference_mode():
         i = 0
         while i < upto:
@@ -921,7 +921,7 @@ def _extend_pkv_with_tokens(past_key_values, token_ids: list[int]):
     if not token_ids:
         return past_key_values
     chunk = (cfg.prefill_chunk if cfg is not None else 32)
-    aggressive = bool(cfg.aggressive_empty_cache) if cfg is not None else False
+    aggressive = bool(cfg.aggressive_empty_cache) if cfg is not None else True
     with torch.inference_mode():
         i = 0
         while i < len(token_ids):
