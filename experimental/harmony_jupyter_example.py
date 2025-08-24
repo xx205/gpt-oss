@@ -10,6 +10,9 @@ import gc
 import time
 import os
 import codecs
+import atexit
+import logging
+from dataclasses import dataclass
 from collections.abc import Iterable, Callable
 from datetime import date
 
@@ -53,6 +56,70 @@ python_tool = None
 _pkv_debug_printed = False
 # Lazy-initialized callable converting a token id to its raw byte sequence
 _decode_token_bytes: Callable[[int], bytes] | None = None
+
+
+# =========================
+# 配置（统一环境变量读取与默认值）
+# =========================
+@dataclass
+class RuntimeConfig:
+    prefill_chunk: int = 32
+    aggressive_empty_cache: bool = False
+    decode_release_every: int = 256
+    temperature: float = 1.0
+    top_p: float = 1.0
+    seed: int | None = None
+    debug: bool = False
+
+
+cfg: RuntimeConfig | None = None
+
+logger = logging.getLogger("harmony_jupyter_example")
+if not logger.handlers:
+    _h = logging.StreamHandler(stream=sys.stderr)
+    _fmt = logging.Formatter("[%(levelname)s] %(message)s")
+    _h.setFormatter(_fmt)
+    logger.addHandler(_h)
+logger.setLevel(logging.INFO)
+
+def _load_config() -> RuntimeConfig:
+    def _get_bool(name: str, default: bool) -> bool:
+        val = os.getenv(name)
+        if val is None:
+            return default
+        return val.strip().lower() in {"1", "true", "yes", "on"}
+
+    def _get_int(name: str, default: int) -> int:
+        v = os.getenv(name)
+        try:
+            return int(v) if v is not None else default
+        except Exception:
+            return default
+
+    def _get_float(name: str, default: float) -> float:
+        v = os.getenv(name)
+        try:
+            return float(v) if v is not None else default
+        except Exception:
+            return default
+
+    seed_env = os.getenv("HARMONY_SEED")
+    seed_val = None
+    if seed_env is not None:
+        try:
+            seed_val = int(seed_env)
+        except Exception:
+            seed_val = None
+
+    return RuntimeConfig(
+        prefill_chunk=_get_int("HARMONY_PREFILL_CHUNK", 32),
+        aggressive_empty_cache=_get_bool("HARMONY_AGGRESSIVE_EMPTY_CACHE", False),
+        decode_release_every=_get_int("HARMONY_DECODE_RELEASE_EVERY", 256),
+        temperature=_get_float("HARMONY_TEMPERATURE", 1.0),
+        top_p=_get_float("HARMONY_TOP_P", 1.0),
+        seed=seed_val,
+        debug=_get_bool("HARMONY_DEBUG", False),
+    )
 
 # ==== Debug helpers (把 token ids 还原为原始文本，并打印 lcp 区段) ====
 def _decode_tokens(ids: list[int]) -> str:
@@ -175,6 +242,11 @@ class JupyterPythonTool:
         while True:
             if time.time() - t0 > self.timeout_s:
                 stderr_parts.append(f"\n[Timeout] execution exceeded {self.timeout_s}s")
+                try:
+                    # 尝试中断正在运行的内核以停止长时间执行
+                    self.km.interrupt_kernel()
+                except Exception:
+                    pass
                 break
             try:
                 msg = self.kc.get_iopub_msg(timeout=0.2)
@@ -235,7 +307,11 @@ def setup_runtime(_model_id: str | None = None) -> None:
     放入 main() 调用，避免 import 时执行重活；也便于后续
     通过参数覆盖 model_id。
     """
-    global tokenizer, model, encoding, browser_tool, python_tool, model_id
+    global tokenizer, model, encoding, browser_tool, python_tool, model_id, cfg, _decode_token_bytes
+    # 读取配置
+    cfg = _load_config()
+    if cfg.debug:
+        logger.setLevel(logging.DEBUG)
     # 允许通过函数参数或环境变量覆盖模型
     if _model_id:
         model_id = _model_id
@@ -249,12 +325,26 @@ def setup_runtime(_model_id: str | None = None) -> None:
     if to_add:
         tokenizer.add_special_tokens({"additional_special_tokens": to_add})
 
-    # 模型（按环境选择设备）
+    # 模型（按环境选择设备与精度）
+    device_map = "cpu"
+    torch_dtype = torch.float32
+    if torch.cuda.is_available():
+        device_map = "auto"
+        # 尽量选择 bfloat16（如支持），否则 fp16
+        bf16_ok = False
+        try:
+            bf16_ok = bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
+        except Exception:
+            try:
+                major, _ = torch.cuda.get_device_capability()
+                bf16_ok = major >= 8
+            except Exception:
+                bf16_ok = False
+        torch_dtype = torch.bfloat16 if bf16_ok else torch.float16
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        device_map="cuda",
-        torch_dtype=torch.bfloat16,
-        # attn_implementation="sdpa",
+        device_map=device_map,
+        torch_dtype=torch_dtype,
     )
 
     # 若刚注册过特殊 token，这里补一次 resize（失败忽略）
@@ -268,12 +358,20 @@ def setup_runtime(_model_id: str | None = None) -> None:
     encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
 
     # 单次确定 token byte 解码器，后续生成无需重复判定
-    global _decode_token_bytes
     _decode_token_bytes = _build_token_byte_decoder()
 
     # 工具（Browser / Python）
-    backend = ExaBackend(source="web")  # 需设置 EXA_API_KEY
-    browser_tool = SimpleBrowserTool(backend=backend)
+    exa_key = os.getenv("EXA_API_KEY")
+    if exa_key and exa_key.strip():
+        try:
+            backend = ExaBackend(source="web")
+            browser_tool = SimpleBrowserTool(backend=backend)
+        except Exception as e:
+            logger.warning("Browser tool init failed; disabling browser. %s", e)
+            browser_tool = None
+    else:
+        logger.info("EXA_API_KEY not set; browser tool disabled.")
+        browser_tool = None
     # 允许通过环境变量切换 python 工具实现：docker | jupyter
     py_impl = os.getenv("HARMONY_PYTHON_TOOL", "jupyter").strip().lower()
     use_docker_default = (py_impl in ("", "default", "docker"))
@@ -299,6 +397,25 @@ def setup_runtime(_model_id: str | None = None) -> None:
     globals()["browser_tool"] = browser_tool
     globals()["python_tool"] = python_tool
 
+    # 随机种子（可复现实验）
+    if cfg.seed is not None:
+        try:
+            torch.manual_seed(cfg.seed)
+        except Exception:
+            pass
+
+    # atexit 清理工具资源
+    def _cleanup():
+        try:
+            if hasattr(python_tool, "shutdown"):
+                python_tool.shutdown()
+        except Exception:
+            pass
+    try:
+        atexit.register(_cleanup)
+    except Exception:
+        pass
+
 # =========================
 # 2) System / Developer / User
 # =========================
@@ -310,12 +427,16 @@ system_msg = (
     .with_reasoning_effort(ReasoningEffort.MEDIUM)
     .with_required_channels(["analysis", "commentary", "final"])
     .with_python_tool()  # 使用内置的（训练时）python 工具定义 = 有状态 Jupyter 约定
-    # .with_browser_tool()
+    .with_browser_tool()
 )
 
 developer_msg = (
     DeveloperContent.new().with_instructions(
         """
+        - 仅使用 system 中声明的工具（python、browser）。
+        - 工具消息使用 commentary 渠道，并明确 recipient。
+        - 如需返回最终答案，使用 final 渠道。
+        - Python 工具调用的内容应为 JSON {"code": "..."} 或直接纯代码文本。
         """
     )
 )
@@ -353,10 +474,11 @@ def _collect_eos_ids():
 def generate_once(
     msgs,
     *,
-    stream=True,
-    max_new_tokens=32768,
+    stream: bool = True,
+    stream_callback: Callable[[str], None] | None = None,
+    max_new_tokens: int = 32768,
     past_key_values=None,
-    processed_tokens=0,
+    processed_tokens: int = 0,
 ):
     """Generate one step using cached KV state (manual streaming decode).
 
@@ -389,7 +511,7 @@ def generate_once(
             cdf = torch.cumsum(sorted_probs, dim=-1)
             mask = cdf > top_p
             # ensure at least 1 token kept
-            if mask[0]:
+            if bool(mask[0].item()):
                 mask[0] = False
             sorted_probs = torch.where(mask, torch.zeros_like(sorted_probs), sorted_probs)
             sorted_probs = sorted_probs / sorted_probs.sum()
@@ -402,7 +524,6 @@ def generate_once(
     convo = Conversation.from_messages(msgs)
     input_token_ids = encoding.render_conversation_for_completion(convo, Role.ASSISTANT)
     total_len = len(input_token_ids)
-    new_input_ids = input_token_ids[processed_tokens:]
 
     # # 观测：生成调用前的 prompt 与 KV 情况
     # try:
@@ -418,8 +539,8 @@ def generate_once(
         # extend PKV with any new input ids except the last token
         if processed_tokens < prefill_upto:
             # feed in chunks to reduce peak
-            chunk = int(os.getenv("HARMONY_PREFILL_CHUNK", "32"))
-            aggressive = os.getenv("HARMONY_AGGRESSIVE_EMPTY_CACHE", "1").lower() in {"1","true","yes"}
+            chunk = (cfg.prefill_chunk if cfg is not None else 32)
+            aggressive = bool(cfg.aggressive_empty_cache) if cfg is not None else False
             i = processed_tokens
             while i < prefill_upto:
                 j = min(prefill_upto, i + chunk)
@@ -433,7 +554,11 @@ def generate_once(
                 except Exception:
                     pass
                 if torch.cuda.is_available():
-                    torch.cuda.synchronize()
+                    if cfg is not None and cfg.debug:
+                        try:
+                            torch.cuda.synchronize()
+                        except Exception:
+                            pass
                     if aggressive:
                         try:
                             torch.cuda.empty_cache()
@@ -446,15 +571,18 @@ def generate_once(
         if total_len > 0:
             cur_token = input_token_ids[-1]
         else:
-            # try to use tokenizer.bos_token_id, else 0
-            cur_token = getattr(tokenizer, 'bos_token_id', 0) or 0
+            # Only use BOS when tokenizer provides one; otherwise, do not inject 0
+            bos_id = getattr(tokenizer, 'bos_token_id', None)
+            if bos_id is None:
+                raise RuntimeError("Empty prompt and tokenizer has no BOS token.")
+            cur_token = int(bos_id)
 
         # streaming decode loop
         eids = _collect_eos_ids()
-        temperature = 1.0
-        top_p = 1.0
-        aggressive = os.getenv("HARMONY_AGGRESSIVE_EMPTY_CACHE", "1").lower() in {"1","true","yes"}
-        release_every = int(os.getenv("HARMONY_DECODE_RELEASE_EVERY", "256"))
+        temperature = (cfg.temperature if cfg is not None else 1.0)
+        top_p = (cfg.top_p if cfg is not None else 1.0)
+        aggressive = bool(cfg.aggressive_empty_cache) if cfg is not None else False
+        release_every = (cfg.decode_release_every if cfg is not None else 256)
         step = 0
         # Byte-level incremental decoder ensures partial UTF-8 sequences are
         # buffered until the remaining bytes arrive in later tokens. Any bytes
@@ -470,21 +598,27 @@ def generate_once(
             out_ids.append(next_id)
 
             if stream:
-                token_bytes = bytes(encoding._inner.decode_bytes([next_id]))
+                # decode via cached decoder to avoid repeated private API lookups
+                if _decode_token_bytes is None:
+                    raise RuntimeError("Token byte decoder not initialized.")
+                token_bytes = _decode_token_bytes(next_id)
                 # Incomplete UTF-8 byte sequences are buffered internally by the
                 # incremental decoder, so "half" characters will be combined
                 # with bytes from subsequent tokens before any text is emitted.
                 decoded = utf8_decoder.decode(token_bytes, final=False)
                 if decoded:
-                    sys.stdout.write(decoded)
-                    sys.stdout.flush()
+                    if stream_callback is not None:
+                        stream_callback(decoded)
+                    else:
+                        sys.stdout.write(decoded)
+                        sys.stdout.flush()
 
             if eids and next_id in eids:
                 break
             cur_token = next_id
             # periodic aggressive release during decode
             step += 1
-            if (step % max(1, release_every)) == 0 and torch.cuda.is_available() and aggressive:
+            if release_every > 0 and (step % release_every) == 0 and torch.cuda.is_available() and aggressive:
                 try:
                     torch.cuda.empty_cache()
                     torch.cuda.ipc_collect()
@@ -495,12 +629,18 @@ def generate_once(
         if stream:
             final_decoded = utf8_decoder.decode(b"", final=True)
             if final_decoded:
-                sys.stdout.write(final_decoded)
-                sys.stdout.flush()
+                if stream_callback is not None:
+                    stream_callback(final_decoded)
+                else:
+                    sys.stdout.write(final_decoded)
+                    sys.stdout.flush()
 
     # 同步 + 清理缓存
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    if torch.cuda.is_available() and cfg is not None and cfg.debug:
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
     _release_cuda()
 
     processed_tokens = total_len + len(out_ids)
@@ -542,7 +682,7 @@ def _run_coro_now(coro):
         finally:
             loop.close()
 
-def collect_tool_messages(result):
+def collect_tool_messages(result) -> list[Message]:
     """把 python_tool.process(...) 的返回统一为 list[Message]。"""
     if result is None:
         return []
@@ -744,13 +884,11 @@ def _rebuild_pkv_for_prefix(input_token_ids: list[int], upto: int):
 
     This is a safe fallback when physical truncation is unavailable.
     """
-    print("-------------------- rebuild happened -------------------------")
     if upto <= 0:
         return None
-    import os
     pkv = None
-    chunk = int(os.getenv("HARMONY_PREFILL_CHUNK", "32"))
-    aggressive = os.getenv("HARMONY_AGGRESSIVE_EMPTY_CACHE", "1").lower() in {"1","true","yes"}
+    chunk = (cfg.prefill_chunk if cfg is not None else 32)
+    aggressive = bool(cfg.aggressive_empty_cache) if cfg is not None else False
     with torch.inference_mode():
         i = 0
         while i < upto:
@@ -765,7 +903,11 @@ def _rebuild_pkv_for_prefix(input_token_ids: list[int], upto: int):
             except Exception:
                 pass
             if torch.cuda.is_available():
-                torch.cuda.synchronize()
+                if cfg is not None and cfg.debug:
+                    try:
+                        torch.cuda.synchronize()
+                    except Exception:
+                        pass
                 if aggressive:
                     try:
                         torch.cuda.empty_cache()
@@ -776,11 +918,10 @@ def _rebuild_pkv_for_prefix(input_token_ids: list[int], upto: int):
 
 def _extend_pkv_with_tokens(past_key_values, token_ids: list[int]):
     """Extend existing PKV by feeding the given token_ids (in chunks)."""
-    import os
     if not token_ids:
         return past_key_values
-    chunk = int(os.getenv("HARMONY_PREFILL_CHUNK", "32"))
-    aggressive = os.getenv("HARMONY_AGGRESSIVE_EMPTY_CACHE", "0").lower() in {"1","true","yes"}
+    chunk = (cfg.prefill_chunk if cfg is not None else 32)
+    aggressive = bool(cfg.aggressive_empty_cache) if cfg is not None else False
     with torch.inference_mode():
         i = 0
         while i < len(token_ids):
@@ -794,7 +935,11 @@ def _extend_pkv_with_tokens(past_key_values, token_ids: list[int]):
             except Exception:
                 pass
             if torch.cuda.is_available():
-                torch.cuda.synchronize()
+                if cfg is not None and cfg.debug:
+                    try:
+                        torch.cuda.synchronize()
+                    except Exception:
+                        pass
                 if aggressive:
                     try:
                         torch.cuda.empty_cache()
@@ -967,7 +1112,8 @@ def _assert_tools_named(sysmsg):
 
 def main() -> None:
     # 在执行前初始化运行时（模型、分词器、工具）
-    if tokenizer is None or model is None or encoding is None or browser_tool is None or python_tool is None:
+    # browser_tool 可能被有意禁用（如缺少 EXA_KEY），因此不作为必要条件
+    if tokenizer is None or model is None or encoding is None or python_tool is None:
         setup_runtime()
     messages = [
         Message.from_role_and_content(Role.SYSTEM, system_msg),
@@ -1046,6 +1192,10 @@ def main() -> None:
 
         last_seen_ids = prev_prefix_ids + out_ids
 
+        # 若无输出 token，跳过昂贵的规范化对齐，但继续下一轮生成
+        if not out_ids:
+            continue
+
         gen_msgs = encoding.parse_messages_from_completion_tokens(out_ids, role=Role.ASSISTANT)
         messages.extend(gen_msgs)
         # 对齐到“规范化后的前缀”，最大化复用，尽量不回退
@@ -1102,8 +1252,17 @@ def main() -> None:
                 # except Exception:
                 #     pass
                 py_call = coerce_python_call_message(last)
-                tool_out = python_tool.process(py_call)
-                tool_msgs = collect_tool_messages(tool_out)
+                try:
+                    tool_out = python_tool.process(py_call)
+                    tool_msgs = collect_tool_messages(tool_out)
+                except Exception as e:
+                    err = json.dumps({"error": f"python tool failed: {e}"})
+                    tool_msgs = [
+                        Message.from_author_and_content(Author.new(Role.TOOL, "python"), err)
+                        .with_channel("commentary")
+                        .with_recipient("assistant")
+                        .with_content_type("json")
+                    ]
                 # 统计工具回传的内容长度（纯文本和 JSON 长度）
                 try:
                     tool_chars = 0
@@ -1127,26 +1286,26 @@ def main() -> None:
                 #     print(f"[KV] after tool: seq_len={after_len}, processed_tokens={processed_tokens}, gpu=({_gpu_mem_stats()})")
             elif base == "browser":
                 # print(f"\n[TOOL DISPATCH] -> {name}")
-                try:
-                    before_len = _kv_seq_len(past_key_values)
-                except Exception:
-                    before_len = -1
-                try:
-                    print(f"[KV] before tool: seq_len={before_len}, processed_tokens={processed_tokens}, gpu=({_gpu_mem_stats()})")
-                except Exception:
-                    pass
-                tool_out = browser_tool.process(last)
-                tool_msgs = collect_tool_messages(tool_out)
-                try:
-                    tool_chars = 0
-                    for m in tool_msgs:
-                        c = getattr(m, "content", "")
-                        if isinstance(c, str):
-                            tool_chars += len(c)
-                    print(f"[TOOL] browser returned messages={len(tool_msgs)}, total_chars={tool_chars}")
-                except Exception:
-                    pass
-                messages.extend(tool_msgs)
+                if browser_tool is None:
+                    messages.append(
+                        Message.from_author_and_content(
+                            Author.new(Role.TOOL, "browser"),
+                            json.dumps({"error": "browser tool disabled or not configured"})
+                        ).with_channel("commentary").with_recipient("assistant").with_content_type("json")
+                    )
+                else:
+                    try:
+                        tool_out = browser_tool.process(last)
+                        tool_msgs = collect_tool_messages(tool_out)
+                    except Exception as e:
+                        err = json.dumps({"error": f"browser tool failed: {e}"})
+                        tool_msgs = [
+                            Message.from_author_and_content(Author.new(Role.TOOL, "browser"), err)
+                            .with_channel("commentary")
+                            .with_recipient("assistant")
+                            .with_content_type("json")
+                        ]
+                    messages.extend(tool_msgs)
                 # try:
                 #     after_len = _kv_seq_len(past_key_values)
                 # except Exception:
