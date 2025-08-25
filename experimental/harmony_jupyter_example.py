@@ -432,12 +432,7 @@ system_msg = (
 
 developer_msg = (
     DeveloperContent.new().with_instructions(
-        """
-        - 仅使用 system 中声明的工具（python、browser）。
-        - 工具消息使用 commentary 渠道，并明确 recipient。
-        - 如需返回最终答案，使用 final 渠道。
-        - Python 工具调用的内容应为 JSON {"code": "..."} 或直接纯代码文本。
-        """
+        "You are a helpful assistant."
     )
 )
 
