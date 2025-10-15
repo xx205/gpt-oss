@@ -2,7 +2,7 @@
 <p align="center">
   <a href="https://gpt-oss.com"><strong>Try gpt-oss</strong></a> ·
   <a href="https://cookbook.openai.com/topic/gpt-oss"><strong>Guides</strong></a> ·
-  <a href="https://openai.com/index/gpt-oss-model-card"><strong>Model card</strong></a> ·
+  <a href="https://arxiv.org/abs/2508.10925"><strong>Model card</strong></a> ·
   <a href="https://openai.com/index/introducing-gpt-oss/"><strong>OpenAI blog</strong></a>
 </p>
 <p align="center">
@@ -90,6 +90,82 @@ vllm serve openai/gpt-oss-20b
 ```
 
 [Learn more about how to use gpt-oss with vLLM.](https://cookbook.openai.com/articles/gpt-oss/run-vllm)
+
+Offline Serve Code:
+- run this code after installing proper libraries as described, while additionally installing this:
+- `uv pip install openai-harmony`
+```python
+# source .oss/bin/activate
+
+import os
+os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+
+import json
+from openai_harmony import (
+    HarmonyEncodingName,
+    load_harmony_encoding,
+    Conversation,
+    Message,
+    Role,
+    SystemContent,
+    DeveloperContent,
+)
+ 
+from vllm import LLM, SamplingParams
+import os
+
+# --- 1) Render the prefill with Harmony ---
+encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+ 
+convo = Conversation.from_messages(
+    [
+        Message.from_role_and_content(Role.SYSTEM, SystemContent.new()),
+        Message.from_role_and_content(
+            Role.DEVELOPER,
+            DeveloperContent.new().with_instructions("Always respond in riddles"),
+        ),
+        Message.from_role_and_content(Role.USER, "What is the weather like in SF?"),
+    ]
+)
+ 
+prefill_ids = encoding.render_conversation_for_completion(convo, Role.ASSISTANT)
+ 
+# Harmony stop tokens (pass to sampler so they won't be included in output)
+stop_token_ids = encoding.stop_tokens_for_assistant_actions()
+ 
+# --- 2) Run vLLM with prefill ---
+llm = LLM(
+    model="openai/gpt-oss-20b",
+    trust_remote_code=True,
+    gpu_memory_utilization = 0.95,
+    max_num_batched_tokens=4096,
+    max_model_len=5000,
+    tensor_parallel_size=1
+)
+ 
+sampling = SamplingParams(
+    max_tokens=128,
+    temperature=1,
+    stop_token_ids=stop_token_ids,
+)
+ 
+outputs = llm.generate(
+    prompt_token_ids=[prefill_ids],   # batch of size 1
+    sampling_params=sampling,
+)
+ 
+# vLLM gives you both text and token IDs
+gen = outputs[0].outputs[0]
+text = gen.text
+output_tokens = gen.token_ids  # <-- these are the completion token IDs (no prefill)
+ 
+# --- 3) Parse the completion token IDs back into structured Harmony messages ---
+entries = encoding.parse_messages_from_completion_tokens(output_tokens, Role.ASSISTANT)
+ 
+# 'entries' is a sequence of structured conversation entries (assistant messages, tool calls, etc.).
+for message in entries:
+    print(f"{json.dumps(message.to_dict())}")
+```
 
 #### PyTorch / Triton / Metal
 
@@ -350,7 +426,7 @@ codex -p oss
 ### Browser
 
 > [!WARNING]
-> This implementation is purely for educational purposes and should not be used in production. You should implement your own equivalent of the [`ExaBackend`](gpt_oss/tools/simple_browser/backend.py) class with your own browsing environment.
+> This implementation is purely for educational purposes and should not be used in production. You should implement your own equivalent of the [`YouComBackend`](gpt_oss/tools/simple_browser/backend.py) class with your own browsing environment. Currently we have available `YouComBackend` and `ExaBackend`. 
 
 Both gpt-oss models were trained with the capability to browse using the `browser` tool that exposes the following three methods:
 
@@ -365,15 +441,20 @@ To enable the browser tool, you'll have to place the definition into the `system
 ```python
 import datetime
 from gpt_oss.tools.simple_browser import SimpleBrowserTool
-from gpt_oss.tools.simple_browser.backend import ExaBackend
+from gpt_oss.tools.simple_browser.backend import YouComBackend
 from openai_harmony import SystemContent, Message, Conversation, Role, load_harmony_encoding, HarmonyEncodingName
 
 encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
 
-# Exa backend requires you to have set the EXA_API_KEY environment variable
-backend = ExaBackend(
+# Depending on the choice of the browser backend you need corresponding env variables setup
+# In case you use You.com backend requires you to have set the YDC_API_KEY environment variable,
+# while for Exa you might need EXA_API_KEY environment variable set
+backend = YouComBackend(
     source="web",
 )
+# backend = ExaBackend(
+#  source="web",
+# )
 browser_tool = SimpleBrowserTool(backend=backend)
 
 # create a basic system prompt
@@ -498,3 +579,17 @@ We recommend sampling with `temperature=1.0` and `top_p=1.0`.
 The reference implementations in this repository are meant as a starting point and inspiration. Outside of bug fixes we do not intend to accept new feature contributions. If you build implementations based on this code such as new tool implementations you are welcome to contribute them to the [`awesome-gpt-oss.md`](./awesome-gpt-oss.md) file.
 
 [harmony]: https://github.com/openai/harmony
+
+## Citation
+
+```bibtex
+@misc{openai2025gptoss120bgptoss20bmodel,
+      title={gpt-oss-120b & gpt-oss-20b Model Card}, 
+      author={OpenAI},
+      year={2025},
+      eprint={2508.10925},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2508.10925}, 
+}
+```
