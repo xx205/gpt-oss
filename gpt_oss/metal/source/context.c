@@ -89,7 +89,8 @@ enum gptoss_status GPTOSS_ABI gptoss_context_create(
     if (status != gptoss_status_success) {
         goto cleanup;
     }
-    status = gptoss_metal_buffer_create(&model->device, model->num_experts * sizeof(uint32_t), NULL, &context->expert_offset_buffer);
+    // The last entry will hold the total number of tokens.
+    status = gptoss_metal_buffer_create(&model->device, (1 + model->num_experts) * sizeof(uint32_t), NULL, &context->expert_offset_buffer);
     if (status != gptoss_status_success) {
         goto cleanup;
     }
@@ -206,7 +207,7 @@ static enum gptoss_status process_tokens(
     assert(num_input_tokens <= context->max_batch_tokens);
     assert(num_output_tokens <= context->max_batch_tokens);
     assert(num_input_tokens >= num_output_tokens);
-    const size_t dense_matmul_kernel_token_multiple_constraint = 64;
+    const size_t min_tokens_for_dense_matmul_kernels = 64;
     const size_t min_tokens_for_dense_moe_kernels = 64;
 
     enum gptoss_status status = gptoss_status_success;
@@ -264,7 +265,7 @@ static enum gptoss_status process_tokens(
                 return status;
             }
 
-            if (input_batch_size % dense_matmul_kernel_token_multiple_constraint == 0) {
+            if (input_batch_size >= min_tokens_for_dense_matmul_kernels) {
                 status = gptoss_metal_command_buffer_encode_launch_f32_bf16w_dense_matmul_qkv(
                     command_buffer,
                     &model->f32_bf16w_dense_matmul_qkv_fn,
@@ -276,11 +277,15 @@ static enum gptoss_status process_tokens(
                     /*bias_offset=*/model->attn_qkv_bias_offset + model->per_block_shared_weights_size * n,
                     &context->qkv_activation_buffer,
                     /*output_offset=*/0,
+                    &context->kvcache_buffer,
+                    /*kv_offset=*/n * model->num_kv_heads * context->max_tokens * 2 * model->head_dim * sizeof(float),
                     &context->control_buffer,
                     /*control_offset=*/0,
                     /*num_tokens=*/input_batch_size,
                     /*num_cols=*/model->embedding_dim,
-                    /*num_rows=*/attn_qkv_dim);
+                    /*num_rows=*/attn_qkv_dim,
+                    /*max_tokens=*/context->max_tokens,
+                    /*token_offset=*/input_batch_start);
                 if (status != gptoss_status_success) {
                     GPTOSS_LOG_ERROR("failed to encode f32_bf16w_dense_matmul_qkv kernel launch");
                     return status;
@@ -292,6 +297,9 @@ static enum gptoss_status process_tokens(
                     /*threadgroup_size=*/32,
                     &context->qkv_activation_buffer,
                     /*input_offset=*/0,
+
+                    &context->kvcache_buffer,
+                    /*kv_offset=*/n * model->num_kv_heads * context->max_tokens * 2 * model->head_dim * sizeof(float),
                     &context->control_buffer,
                     /*control_offset=*/0,
                     model->rope_theta,
@@ -303,29 +311,13 @@ static enum gptoss_status process_tokens(
                     model->num_heads,
                     model->num_kv_heads,
                     model->head_dim,
+                    /*max_tokens=*/context->max_tokens,
                     /*token_offset=*/input_batch_start);
                 if (status != gptoss_status_success) {
                     GPTOSS_LOG_ERROR("failed to encode f32_rope kernel launch");
                     return status;
                 }
 
-                for (uint32_t t = 0; t < input_batch_size; t++) {
-                    for (uint32_t kv = 0; kv < 2; kv++) {
-                        for (uint32_t h = 0; h < model->num_kv_heads; h++) {
-                            status = gptoss_metal_command_buffer_encode_copy_buffer(
-                                command_buffer,
-                                &context->qkv_activation_buffer,
-                                /*input_offset=*/(t * attn_qkv_dim + (model->num_heads + kv * model->num_kv_heads + h) * model->head_dim) * sizeof(float),
-                                &context->kvcache_buffer,
-                                /*output_offset=*/(((n * model->num_kv_heads + h) * context->max_tokens + input_batch_start + t) * 2 + kv) * model->head_dim * sizeof(float),
-                                /*size=*/model->head_dim * sizeof(float));
-                            if (status != gptoss_status_success) {
-                                GPTOSS_LOG_ERROR("failed to encode copy of token %" PRIu32 " to KV cache", t);
-                                return status;
-                            }
-                        }
-                    }
-                }
             } else {
                 status = gptoss_metal_command_buffer_encode_launch_f32_bf16w_matmul_qkv(
                     command_buffer,
@@ -385,7 +377,7 @@ static enum gptoss_status process_tokens(
                     return status;
                 }
 
-                if (input_batch_size % dense_matmul_kernel_token_multiple_constraint == 0) {
+                if (input_batch_size >= min_tokens_for_dense_matmul_kernels) {
                     status = gptoss_metal_command_buffer_encode_launch_f32_bf16w_dense_matmul_attn_output(
                         command_buffer,
                         &model->f32_bf16w_dense_matmul_attn_output_fn,
@@ -447,7 +439,7 @@ static enum gptoss_status process_tokens(
                     GPTOSS_LOG_ERROR("failed to encode f32_bf16w_rmsnorm kernel launch");
                     return status;
                 }
-                if (input_batch_size % dense_matmul_kernel_token_multiple_constraint == 0) {
+                if (input_batch_size >= min_tokens_for_dense_matmul_kernels) {
                     status = gptoss_metal_command_buffer_encode_launch_f32_bf16w_dense_matmul_mlp_gate(
                         command_buffer,
                         &model->f32_bf16w_dense_matmul_mlp_gate_fn,
@@ -530,47 +522,19 @@ static enum gptoss_status process_tokens(
 
                 // If we have enough tokens in prefill, we will pick the prefill-optimized kernels.
                 if (num_block_output_tokens >= min_tokens_for_dense_moe_kernels) {
-                    // Commit and wait for the command buffer to complete.
-                    // As we need topk output to compute routing metadata.
-                    status = gptoss_metal_command_buffer_commit(command_buffer);
+                    status = gptoss_metal_command_buffer_encode_launch_expert_routing_metadata(
+                        command_buffer,
+                        &model->f32_expert_routing_metadata_fn,
+                        &context->expert_activation_buffer,
+                        /*expert_predictions_offset=*/0,
+                        &context->expert_offset_buffer,
+                        /*expert_offsets_offset=*/0,
+                        &context->token_to_expert_routing_buffer,
+                        /*intra_expert_offsets_offset=*/0,
+                        num_block_output_tokens * model->num_active_experts,
+                        model->num_experts);
                     if (status != gptoss_status_success) {
-                        return status;
-                    }
-        
-                    status = gptoss_metal_command_buffer_wait_completion(command_buffer, NULL);
-                    if (status != gptoss_status_success) {
-                        return status;
-                    }
-                    gptoss_metal_command_buffer_release(command_buffer);
-
-                    const size_t E = model->num_experts;
-                    const size_t T = num_block_output_tokens * model->num_active_experts;
-
-                    const struct gptoss_expert_prediction* preds =
-                        (const struct gptoss_expert_prediction*) context->expert_activation_buffer.ptr;
-
-                    uint32_t* token_to_expert_routing = (uint32_t*) context->token_to_expert_routing_buffer.ptr;
-                    uint32_t* expert_offset = (uint32_t*) context->expert_offset_buffer.ptr;
-                    // Zero out the expert offset buffer.
-                    memset(expert_offset, 0, E * sizeof(uint32_t));
-
-                    for (size_t i = 0; i < T; i++) {
-                        const uint32_t expert_id = preds[i].expert_id;
-                        token_to_expert_routing[i] = expert_offset[expert_id];
-                        expert_offset[expert_id]++;
-                    }
-
-                    uint32_t total = 0;
-                    // Prefix sum.
-                    for (size_t i = 0; i < model->num_experts; i++) {
-                        const uint32_t bin_size = expert_offset[i];
-                        expert_offset[i] = total;
-                        total += bin_size;
-                    }
-
-                    // Create a new command buffer.
-                    status = gptoss_metal_command_buffer_create(&context->model->command_queue, command_buffer);
-                    if (status != gptoss_status_success) {
+                        GPTOSS_LOG_ERROR("failed to encode f32_expert_routing_metadata kernel launch");
                         return status;
                     }
                     status = gptoss_metal_command_buffer_encode_launch_f32_scatter(
@@ -593,71 +557,59 @@ static enum gptoss_status process_tokens(
                         GPTOSS_LOG_ERROR("failed to encode f32_scatter kernel launch");
                         return status;
                     } 
-                    // Dense MoE SwiGLU matmul -- iterate over all experts.
-                    const size_t total_tokens = num_block_output_tokens * model->num_active_experts;
-                    for (size_t e = 0; e < model->num_experts; e++) {
-                        bool last_expert = e == model->num_experts - 1;
-                        uint32_t expert_tokens = last_expert ? total_tokens - expert_offset[e] : expert_offset[e + 1] - expert_offset[e];
-                        if (expert_tokens == 0) {
-                            continue;
-                        }
-                        status = gptoss_metal_command_buffer_encode_launch_f32_mf4w_moe_dense_matmul_swiglu(
-                            command_buffer,
-                            &model->f32_mf4w_moe_dense_matmul_swiglu_fn,
-                            &context->swiglu_input_buffer,
-                            /*input_offset=*/0,
-                            &model->block_weight_buffers[n],
-                            /*weight_block_offset=*/0,
-                            &model->block_weight_buffers[n],
-                            /*weight_scale_offset=*/model->mlp_swiglu_scale_offset,
-                            &model->block_weight_buffers[n],
-                            /*bias_offset=*/model->mlp_swiglu_bias_offset,
-                            &context->swiglu_activation_buffer,
-                            /*output_offset=*/0,
-                            model->swiglu_limit,
-                            /*expert_stride_bytes=*/model->per_expert_block_weight_size,
-                            expert_tokens,
-                            expert_offset[e],
-                            e,
-                            model->embedding_dim,
-                            2 * model->mlp_dim);
-                        if (status != gptoss_status_success) {
-                            GPTOSS_LOG_ERROR("failed to encode f32_mf4w_moe_dense_matmul_swiglu kernel launch");
-                            return status;
-                        }
-                    } 
-                    // Dense MoE proj matmul -- again iterate over all experts.
-                    for (size_t e = 0; e < model->num_experts; e++) {
-                        bool last_expert = e == model->num_experts - 1;
-                        uint32_t expert_tokens = last_expert ? total_tokens - expert_offset[e] : expert_offset[e + 1] - expert_offset[e];
-                        if (expert_tokens == 0) {
-                            continue;
-                        }
-                        status = gptoss_metal_command_buffer_encode_launch_f32_mf4w_moe_dense_matmul(
-                            command_buffer,
-                            &model->f32_mf4w_moe_dense_matmul_fn,
-                            &context->swiglu_activation_buffer,
-                            /*input_offset=*/0,
-                            &model->block_weight_buffers[n],
-                            /*weight_block_offset=*/model->mlp_out_block_offset,
-                            &model->block_weight_buffers[n],
-                            /*weight_scale_offset=*/model->mlp_out_scale_offset,
-                            &model->block_weight_buffers[n],
-                            /*bias_offset=*/model->mlp_out_bias_offset,
-                            &context->moe_activation_buffer,
-                            /*output_offset=*/0,
-                            /*expert_stride_bytes=*/model->per_expert_block_weight_size,
-                            expert_tokens,
-                            expert_offset[e],
-                            e,
-                            model->mlp_dim,
-                            model->embedding_dim);
-                        if (status != gptoss_status_success) {
-                            GPTOSS_LOG_ERROR("failed to encode f32_mf4w_moe_dense_matmul_swiglu kernel launch");
-                            return status;
-                        }
+                    // Dense MoE SwiGLU matmul.
+                    status = gptoss_metal_command_buffer_encode_launch_f32_mf4w_moe_dense_matmul_swiglu(
+                        command_buffer,
+                        &model->f32_mf4w_moe_dense_matmul_swiglu_fn,
+                        &context->expert_offset_buffer,
+                        /*expert_offsets_offset=*/0,
+                        &context->swiglu_input_buffer,
+                        /*input_offset=*/0,
+                        &model->block_weight_buffers[n],
+                        /*weight_block_offset=*/0,
+                        &model->block_weight_buffers[n],
+                        /*weight_scale_offset=*/model->mlp_swiglu_scale_offset,
+                        &model->block_weight_buffers[n],
+                        /*bias_offset=*/model->mlp_swiglu_bias_offset,
+                        &context->swiglu_activation_buffer,
+                        /*output_offset=*/0,
+                        model->swiglu_limit,
+                        /*expert_stride_bytes=*/model->per_expert_block_weight_size,
+                        num_block_output_tokens,
+                        model->num_experts,
+                        model->embedding_dim,
+                        2 * model->mlp_dim);
+                    if (status != gptoss_status_success) {
+                        GPTOSS_LOG_ERROR("failed to encode f32_mf4w_moe_dense_matmul_swiglu kernel launch");
+                        return status;
                     }
 
+                    // Dense MoE proj matmul.
+                    status = gptoss_metal_command_buffer_encode_launch_f32_mf4w_moe_dense_matmul(
+                        command_buffer,
+                        &model->f32_mf4w_moe_dense_matmul_fn,
+                        &context->expert_offset_buffer,
+                        /*expert_offsets_offset=*/0,
+                        &context->swiglu_activation_buffer,
+                        /*input_offset=*/0,
+                        &model->block_weight_buffers[n],
+                        /*weight_block_offset=*/model->mlp_out_block_offset,
+                        &model->block_weight_buffers[n],
+                        /*weight_scale_offset=*/model->mlp_out_scale_offset,
+                        &model->block_weight_buffers[n],
+                        /*bias_offset=*/model->mlp_out_bias_offset,
+                        &context->moe_activation_buffer,
+                        /*output_offset=*/0,
+                        /*expert_stride_bytes=*/model->per_expert_block_weight_size,
+                        num_block_output_tokens,
+                        model->num_experts,
+                        model->mlp_dim,
+                        model->embedding_dim);
+                    if (status != gptoss_status_success) {
+                        GPTOSS_LOG_ERROR("failed to encode f32_mf4w_moe_dense_matmul_swiglu kernel launch");
+                        return status;
+                    }
+                    // Gather and accumulate.
                     status = gptoss_metal_command_buffer_encode_launch_f32_gather_and_accumulate_e4(
                         command_buffer,
                         &model->f32_gather_and_accumulate_e4_fn,

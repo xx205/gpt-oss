@@ -104,6 +104,15 @@ struct gptoss_dense_matmul_args {
     uint32_t k;
 };
 
+// Specialize qkv matmul args as it writes kv directly to the KV cache buffer.
+struct gptoss_dense_matmul_qkv_args {
+    uint32_t m;
+    uint32_t n;
+    uint32_t k;
+    uint32_t max_tokens;
+    uint32_t token_offset;
+};
+
 struct gptoss_scatter_args {
     uint32_t tokens;
     uint32_t active_experts_per_token;
@@ -111,11 +120,8 @@ struct gptoss_scatter_args {
 };
 
 struct gptoss_moe_dense_matmul_swiglu_args {
-    uint32_t expert_token_count;
     uint32_t k;
     uint32_t n;
-    uint32_t expert_id;
-    uint32_t expert_token_offset;
     uint32_t weight_blocks_expert_stride_bytes;
     uint32_t weight_scales_expert_stride_bytes;
     uint32_t bias_expert_stride_bytes;
@@ -123,14 +129,16 @@ struct gptoss_moe_dense_matmul_swiglu_args {
     float swiglu_max;
 };
 struct gptoss_moe_dense_matmul_args {
-    uint32_t expert_token_count;
     uint32_t k;
     uint32_t n;
-    uint32_t expert_id;
-    uint32_t expert_token_offset;
     uint32_t weight_blocks_expert_stride_bytes;
     uint32_t weight_scales_expert_stride_bytes;
     uint32_t bias_expert_stride_bytes;
+};
+
+struct gptoss_expert_routing_metadata_args {
+uint32_t tokens;
+    uint32_t num_experts;
 };
 
 struct gptoss_gather_args {
@@ -167,6 +175,7 @@ struct gptoss_moe_matmul_args {
 struct gptoss_rope_args {
     uint32_t token_stride;
     uint32_t token_offset;
+    uint32_t max_tokens;
     float freq_scale;
     float interpolation_scale;
     float yarn_offset;
