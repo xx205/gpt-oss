@@ -629,7 +629,6 @@ def setup_runtime(_model_id: Optional[str] = None) -> None:
         model_id,
         torch_dtype=dtype,       # 使用 torch_dtype 参数以兼容多数 Transformers 版本
         device_map=device_map,
-        attn_implementation="kernels-community/vllm-flash-attn3",
     ).eval()
 
     # 若手动扩展了 vocab，需要 resize；失败可以忽略
