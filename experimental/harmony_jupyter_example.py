@@ -82,6 +82,9 @@ browser_tool = None       # type: ignore[assignment]
 python_tool = None        # type: ignore[assignment]
 _decode_token_bytes: Callable[[int], bytes] | None = None
 _assistant_start_token_ids: List[int] | None = None
+_token_id_end: int | None = None
+_token_id_call: int | None = None
+_token_id_return: int | None = None
 
 
 # =========================
@@ -184,6 +187,33 @@ def _build_token_byte_decoder() -> Callable[[int], bytes]:
 
     decode_bytes = inner.decode_bytes
     return lambda token_id: bytes(decode_bytes([token_id]))
+
+def _get_model_input_device(m: torch.nn.Module) -> torch.device:
+    """
+    Pick a safe device for input tensors under `device_map="auto"` sharding.
+    Prefer the embedding weight device; fall back to model/parameter devices.
+    """
+    try:
+        emb = m.get_input_embeddings()  # type: ignore[attr-defined]
+        if emb is not None and hasattr(emb, "weight"):
+            dev = emb.weight.device  # type: ignore[union-attr]
+            if getattr(dev, "type", None) != "meta":
+                return dev
+    except Exception:
+        pass
+
+    dev = getattr(m, "device", None)
+    if dev is not None and getattr(dev, "type", None) != "meta":
+        return dev
+
+    try:
+        dev = next(m.parameters()).device
+        if getattr(dev, "type", None) != "meta":
+            return dev
+    except Exception:
+        pass
+
+    return torch.device("cpu")
 
 
 def _echo_token_ids_exact(token_ids: List[int]) -> None:
@@ -580,9 +610,7 @@ class KvCacheManager:
             f"len(prefix_ids)={len(self.prefix_ids)}"
         )
 
-        device = getattr(self.model, "device", None)
-        if device is None:
-            device = next(self.model.parameters()).device  # 兼容 device_map="auto"
+        device = _get_model_input_device(self.model)
 
         idx = cur_len
         last_logits: torch.Tensor | None = None
@@ -669,6 +697,7 @@ def setup_runtime(_model_id: Optional[str] = None) -> None:
     """
 
     global tokenizer, model, encoding, browser_tool, python_tool, model_id, cfg, _decode_token_bytes, _assistant_start_token_ids
+    global _token_id_end, _token_id_call, _token_id_return
 
     cfg = _load_config()
     if cfg.debug:
@@ -715,6 +744,18 @@ def setup_runtime(_model_id: Optional[str] = None) -> None:
         )
     except Exception:
         _assistant_start_token_ids = [200006, 173781]  # `<|start|>`, `assistant`
+    # 常用特殊 token id（用于 stop-token 归一化等）
+    try:
+        inner = getattr(encoding, "_inner", None)
+        if inner is None:
+            raise AttributeError("encoding._inner missing")
+        _token_id_end = int(inner.encode("<|end|>", ["<|end|>"])[0])
+        _token_id_call = int(inner.encode("<|call|>", ["<|call|>"])[0])
+        _token_id_return = int(inner.encode("<|return|>", ["<|return|>"])[0])
+    except Exception:
+        _token_id_end = 200007
+        _token_id_call = 200012
+        _token_id_return = 200002
 
     # --- Tools: Browser / Python ---
     exa_key = os.getenv("EXA_API_KEY")
@@ -853,6 +894,12 @@ def generate_assistant_once(
 
     # Harmony stop tokens（一般包含 <|return|> & <|call|>）
     stop_token_ids: List[int] = encoding.stop_tokens_for_assistant_actions()
+    assert _token_id_end is not None and _token_id_return is not None
+    token_id_end = int(_token_id_end)
+    token_id_return = int(_token_id_return)
+
+    structural_token_ids = set(stop_token_ids)
+    structural_token_ids.add(token_id_end)
     temperature = cfg.temperature if cfg is not None else 1.0
     top_p = cfg.top_p if cfg is not None else 1.0
     release_every = cfg.decode_release_every if cfg is not None else 256
@@ -869,11 +916,55 @@ def generate_assistant_once(
 
         is_stop = next_id in stop_token_ids
 
+        # `<|return|>` 只作为 decode-time stop：不要把它持久化进 history。
+        # Harmony 的对话历史里，assistant 的普通消息应该以 `<|end|>` 结束（而不是 `<|return|>`）。
+        if next_id == token_id_return:
+            # 若模型尚未输出 `<|end|>`，则补一个 `<|end|>` 进入历史并回灌 KV，保证下一轮 prompt 结构正确。
+            if not completion_ids or completion_ids[-1] != token_id_end:
+                completion_ids.append(token_id_end)
+                if stream and echo_stop:
+                    outb = getattr(sys.stdout, "buffer", None)
+                    if stream_callback is None and outb is not None:
+                        outb.write(_decode_token_bytes(token_id_end))
+                        outb.flush()
+                    else:
+                        token_bytes = _decode_token_bytes(token_id_end)
+                        decoded = utf8_decoder.decode(token_bytes, final=False)
+                        if decoded:
+                            if stream_callback is not None:
+                                stream_callback(decoded)
+                            else:
+                                sys.stdout.write(decoded)
+                                sys.stdout.flush()
+
+                with torch.inference_mode():
+                    device = _get_model_input_device(model)
+                    cache_pos = torch.tensor([decode_len], dtype=torch.long, device=device)
+                    seq_len = decode_len + 1
+                    attn_mask = torch.ones(1, seq_len, dtype=torch.long, device=device)
+                    inp = torch.tensor([[token_id_end]], dtype=torch.long, device=device)
+                    outputs = model(
+                        input_ids=inp,
+                        attention_mask=attn_mask,
+                        cache_position=cache_pos,
+                        past_key_values=decode_cache,
+                        use_cache=True,
+                        return_dict=True,
+                    )
+
+                decode_cache = outputs.past_key_values
+                decode_len += 1
+                last_logits = outputs.logits[0, -1, :]
+                step += 1
+                if release_every > 0 and step % release_every == 0 and torch.cuda.is_available() and aggressive:
+                    _release_cuda()
+            break
+
         # stop token 也要写入 completion_ids 并回灌模型（保证与 Harmony render 的 token 流一致，
-        # 尤其是 tool-call 末尾的 <|call|>），但不作为可见输出流。
+        # 尤其是 tool-call 末尾的 <|call|>）。
         completion_ids.append(next_id)
 
-        if stream and (not is_stop or echo_stop):
+        if stream and (next_id not in structural_token_ids or echo_stop):
             # 为了 byte-level 一致性，优先直接写 raw bytes（无 callback 时）
             outb = getattr(sys.stdout, "buffer", None)
             if stream_callback is None and outb is not None:
@@ -891,7 +982,7 @@ def generate_assistant_once(
 
         # 把新 token 回灌模型，并更新 decode 阶段的 KV / 长度
         with torch.inference_mode():
-            device = model.device
+            device = _get_model_input_device(model)
             # 本次新 token 的逻辑位置 = 当前 decode_len
             cache_pos = torch.tensor(
                 [decode_len],
