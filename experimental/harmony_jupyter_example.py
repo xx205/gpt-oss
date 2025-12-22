@@ -90,9 +90,11 @@ _assistant_start_token_ids: List[int] | None = None
 
 @dataclass
 class RuntimeConfig:
-    prefill_chunk: int = 128          # prefill 时的最大 chunk 大小（token 数）
-    decode_release_every: int = 256   # 每多少 decode 步主动清一次 CUDA cache（0 = 不清）
+    prefill_chunk: int = 32           # prefill 时的最大 chunk 大小（token 数）
+    decode_release_every: int = 512   # 每多少 decode 步主动清一次 CUDA cache（0 = 不清）
     aggressive_empty_cache: bool = True
+    echo_tool_messages: bool = False
+    echo_stop_tokens: bool = False
     temperature: float = 1.0
     top_p: float = 1.0
     seed: Optional[int] = None
@@ -139,14 +141,17 @@ def _load_config() -> RuntimeConfig:
         except Exception:
             seed_val = None
 
+    debug_flag = _get_bool("DEBUG", False)
     return RuntimeConfig(
-        prefill_chunk=_get_int("PREFILL_CHUNK", 128),
+        prefill_chunk=_get_int("PREFILL_CHUNK", 32),
         aggressive_empty_cache=_get_bool("AGGRESSIVE_EMPTY_CACHE", True),
-        decode_release_every=_get_int("DECODE_RELEASE_EVERY", 256),
+        decode_release_every=_get_int("DECODE_RELEASE_EVERY", 512),
+        echo_tool_messages=_get_bool("ECHO_TOOL_MESSAGES", debug_flag),
+        echo_stop_tokens=_get_bool("ECHO_STOP_TOKENS", debug_flag),
         temperature=_get_float("TEMPERATURE", 1.0),
         top_p=_get_float("TOP_P", 1.0),
         seed=seed_val,
-        debug=_get_bool("DEBUG", False),
+        debug=debug_flag,
     )
 
 
@@ -179,6 +184,28 @@ def _build_token_byte_decoder() -> Callable[[int], bytes]:
 
     decode_bytes = inner.decode_bytes
     return lambda token_id: bytes(decode_bytes([token_id]))
+
+
+def _echo_token_ids_exact(token_ids: List[int]) -> None:
+    """把 Harmony token_ids 原样写到 stdout（raw bytes），用于调试 token/提示词一致性."""
+    assert _decode_token_bytes is not None
+    outb = getattr(sys.stdout, "buffer", None)
+    if outb is None:
+        # fallback：没有 buffer 时用增量 UTF-8 解码（不保证 byte-level 100% 一致）
+        utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
+        for tid in token_ids:
+            s = utf8_decoder.decode(_decode_token_bytes(tid), final=False)
+            if s:
+                sys.stdout.write(s)
+        tail = utf8_decoder.decode(b"", final=True)
+        if tail:
+            sys.stdout.write(tail)
+        sys.stdout.flush()
+        return
+
+    for tid in token_ids:
+        outb.write(_decode_token_bytes(tid))
+    outb.flush()
 
 
 def _softmax_sample_top_p(
@@ -593,7 +620,7 @@ class KvCacheManager:
 
             self.total_len += chunk_len
             idx += chunk_len
-            torch.cuda.empty_cache()
+            _release_cuda()
 
         # 更新 prefix_ids 为“本轮完整 prompt 序列”
         self.prefix_ids = list(input_ids)
@@ -830,6 +857,7 @@ def generate_assistant_once(
     top_p = cfg.top_p if cfg is not None else 1.0
     release_every = cfg.decode_release_every if cfg is not None else 256
     aggressive = bool(cfg.aggressive_empty_cache) if cfg is not None else True
+    echo_stop = bool(cfg.echo_stop_tokens) if cfg is not None else False
 
     utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
     completion_ids: List[int] = []
@@ -845,15 +873,21 @@ def generate_assistant_once(
         # 尤其是 tool-call 末尾的 <|call|>），但不作为可见输出流。
         completion_ids.append(next_id)
 
-        if stream and not is_stop:
-            token_bytes = _decode_token_bytes(next_id)
-            decoded = utf8_decoder.decode(token_bytes, final=False)
-            if decoded:
-                if stream_callback is not None:
-                    stream_callback(decoded)
-                else:
-                    sys.stdout.write(decoded)
-                    sys.stdout.flush()
+        if stream and (not is_stop or echo_stop):
+            # 为了 byte-level 一致性，优先直接写 raw bytes（无 callback 时）
+            outb = getattr(sys.stdout, "buffer", None)
+            if stream_callback is None and outb is not None:
+                outb.write(_decode_token_bytes(next_id))
+                outb.flush()
+            else:
+                token_bytes = _decode_token_bytes(next_id)
+                decoded = utf8_decoder.decode(token_bytes, final=False)
+                if decoded:
+                    if stream_callback is not None:
+                        stream_callback(decoded)
+                    else:
+                        sys.stdout.write(decoded)
+                        sys.stdout.flush()
 
         # 把新 token 回灌模型，并更新 decode 阶段的 KV / 长度
         with torch.inference_mode():
@@ -982,6 +1016,7 @@ def main() -> None:
     kv_manager = KvCacheManager(model, prefill_chunk=(cfg.prefill_chunk if cfg else 128))
     # 初始化 token 历史：从当前 messages 渲染（后续将用“真实 token 流”增量维护）
     kv_manager.history_ids = encoding.render_conversation(Conversation.from_messages(messages))
+    echo_tool = bool(cfg.echo_tool_messages) if cfg is not None else False
 
     for _ in range(MAX_STEPS):
         # 1) 让模型说话（可能是 tool 调用，也可能直接给出最终答案）
@@ -1021,7 +1056,10 @@ def main() -> None:
                     ]
                 messages.extend(tool_msgs)
                 for m in tool_msgs:
-                    kv_manager.history_ids.extend(encoding.render(m))
+                    toks = encoding.render(m)
+                    kv_manager.history_ids.extend(toks)
+                    if echo_tool:
+                        _echo_token_ids_exact(toks)
                 # 下一轮循环会基于新的 messages 继续采样
                 continue
 
@@ -1054,7 +1092,10 @@ def main() -> None:
 
                 messages.extend(tool_msgs)
                 for m in tool_msgs:
-                    kv_manager.history_ids.extend(encoding.render(m))
+                    toks = encoding.render(m)
+                    kv_manager.history_ids.extend(toks)
+                    if echo_tool:
+                        _echo_token_ids_exact(toks)
                 continue
 
             else:
@@ -1068,7 +1109,10 @@ def main() -> None:
                     .with_recipient("assistant")
                     .with_content_type("json")
                 )
-                kv_manager.history_ids.extend(encoding.render(messages[-1]))
+                toks = encoding.render(messages[-1])
+                kv_manager.history_ids.extend(toks)
+                if echo_tool:
+                    _echo_token_ids_exact(toks)
                 continue
 
         # 3) 若不是工具调用，则检查是否已经给出 final 消息
