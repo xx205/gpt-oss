@@ -9,11 +9,12 @@ Key changes vs the original script:
    and poking into `past_key_values`. This makes the code robust to
    internal changes in Transformers (incl. GPT-OSS sliding attention).
 2. Implement a simpler, prefix-based KV reuse strategy:
-   - Reuse the cache only when the new Harmony-rendered prompt is a
+   - Reuse the cache only when the new prompt token stream is a
      *strict prefix extension* of the previous one.
    - Otherwise, rebuild the cache from scratch.
-   This is slightly weaker than the old token-accurate LCP truncation,
-   but dramatically simpler and much more future-proof.
+   Note: we build prompts from the *actual token history* (including any
+   non-canonical Harmony headers the model emitted) to avoid parse→render
+   normalization breaking token-level KV reuse.
 3. Follow Harmony’s recommendation to *not* feed stop tokens
    (`<|return|>`, `<|call|>`, etc.) into the parser, and treat
    `<|return|>` as a decode-time stop only.
@@ -80,6 +81,7 @@ encoding = None           # type: ignore[assignment]
 browser_tool = None       # type: ignore[assignment]
 python_tool = None        # type: ignore[assignment]
 _decode_token_bytes: Callable[[int], bytes] | None = None
+_assistant_start_token_ids: List[int] | None = None
 
 
 # =========================
@@ -129,7 +131,7 @@ def _load_config() -> RuntimeConfig:
         except Exception:
             return default
 
-    seed_env = os.getenv("HARMONY_SEED")
+    seed_env = os.getenv("SEED")
     seed_val: Optional[int] = None
     if seed_env is not None:
         try:
@@ -138,13 +140,13 @@ def _load_config() -> RuntimeConfig:
             seed_val = None
 
     return RuntimeConfig(
-        prefill_chunk=_get_int("HARMONY_PREFILL_CHUNK", 128),
-        aggressive_empty_cache=_get_bool("HARMONY_AGGRESSIVE_EMPTY_CACHE", True),
-        decode_release_every=_get_int("HARMONY_DECODE_RELEASE_EVERY", 256),
-        temperature=_get_float("HARMONY_TEMPERATURE", 1.0),
-        top_p=_get_float("HARMONY_TOP_P", 1.0),
+        prefill_chunk=_get_int("PREFILL_CHUNK", 128),
+        aggressive_empty_cache=_get_bool("AGGRESSIVE_EMPTY_CACHE", True),
+        decode_release_every=_get_int("DECODE_RELEASE_EVERY", 256),
+        temperature=_get_float("TEMPERATURE", 1.0),
+        top_p=_get_float("TOP_P", 1.0),
         seed=seed_val,
-        debug=_get_bool("HARMONY_DEBUG", False),
+        debug=_get_bool("DEBUG", False),
     )
 
 
@@ -398,11 +400,15 @@ class KvCacheManager:
       才会复用前缀对应的 KV；否则整体重建。
 
     注意 / 假设：
-    - Harmony 的 render ↔ parse 在 token 级是无损往返的；
     - 上层对话是“只追加不回写”：不会修改历史消息内容，只会在末尾 append
       新的 user / assistant / tool 消息。
-      若这两个假设不成立，render 后的新 input_ids 可能不再以 prefix_ids
-      为前缀，此时本类会自动 reset，放弃 KV 复用，保证语义正确。
+      若该假设不成立，新 input_ids 可能不再以旧 prefix 为前缀，此时本类会自动 reset，
+      放弃 KV 复用，保证语义正确。
+
+    额外说明：
+    - 实测某些模型会输出“等价但非规范”的 Harmony message header（例如把 `to=python` 写进
+      channel 字段），parser 会规范化该结构，导致 parse→render 的 token 流不再一致。
+      因此本 runner 使用 kv_manager.history_ids 维护“真实 token 历史”，避免无谓的 cache 重建。
     """
 
     def __init__(self, model: AutoModelForCausalLM, prefill_chunk: int = 128):
@@ -412,6 +418,9 @@ class KvCacheManager:
         self.cache: Optional[DynamicCache] = None
         self.prefix_ids: List[int] = []
         self.total_len: int = 0
+        # 已确认“写入 prompt 的真实 token 流”（包含模型曾生成的非规范 header 形式）。
+        # 用它来构造下一轮 prompt，避免 parse→render 规范化导致 token 不一致从而破坏 KV 复用。
+        self.history_ids: List[int] = []
 
         # 简单的统计信息
         self.stats: dict[str, int] = {
@@ -456,27 +465,56 @@ class KvCacheManager:
         # --- 2) 基本不变量检查：cache 未就绪 / 长度不一致 → 直接 reset ---
         # 额外：若 DynamicCache 内部记录的长度与 total_len 不一致，也直接 reset，
         # 防止未来有其他代码路径修改了 cache 却忘记同步 meta。
-        real_len: Optional[int] = None
+        real_lens: list[int] = []
         if self.cache is not None:
-            try:
-                # DynamicCache 提供的真实序列长度（包含 sliding-window 内部截断）
-                real_len = self.cache.get_seq_length()
-            except Exception:
-                real_len = None
+            # 对 hybrid 结构：不同 layer 的 cache 长度可能不同。
+            # - sliding window / chunked attention 层：长度可能被上限卡住，出现 real_len < total_len（正常）
+            # - full attention 层：通常会随 total_len 增长
+            # 因此这里采样多个 layer 的 seq_length，用区间判断“是否明显不可能”。
+            n_layers = int(getattr(self.model.config, "num_hidden_layers", 0) or 0)
+            probe_idxs = {0, 1, n_layers - 1}
+            for li in sorted(i for i in probe_idxs if 0 <= i < n_layers):
+                try:
+                    real_lens.append(int(self.cache.get_seq_length(layer_idx=li)))  # type: ignore[call-arg]
+                except TypeError:
+                    # 兼容不支持 layer_idx 的实现：退回到默认 layer
+                    try:
+                        real_lens = [int(self.cache.get_seq_length())]
+                    except Exception:
+                        real_lens = []
+                    break
+                except Exception:
+                    continue
+
+            if not real_lens:
+                try:
+                    real_lens = [int(self.cache.get_seq_length())]
+                except Exception:
+                    real_lens = []
+
+        bad_real_len = False
+        if real_lens:
+            mx = max(real_lens)
+            # 允许 mx < total_len（滑窗层会卡住），但不允许任何探针层 > total_len
+            if mx > self.total_len:
+                bad_real_len = True
+            # 若历史已有前缀，却所有探针层都为 0，也很可疑
+            if old_prefix_len > 0 and mx == 0:
+                bad_real_len = True
 
         if (
             self.cache is None
             or self.total_len != old_prefix_len
-            or (real_len is not None and real_len != self.total_len)
+            or bad_real_len
         ):
             reset_reason = "uninitialized_or_invariant_broken"
             logger.debug(
                 "KvCacheManager: resetting cache (cache is %s, total_len=%d, "
-                "prefix_len=%d, real_len=%s)",
+                "prefix_len=%d, real_lens=%s)",
                 "None" if self.cache is None else "set",
                 self.total_len,
                 old_prefix_len,
-                str(real_len),
+                str(real_lens),
             )
             self.reset()
             can_try_reuse = False
@@ -555,6 +593,7 @@ class KvCacheManager:
 
             self.total_len += chunk_len
             idx += chunk_len
+            torch.cuda.empty_cache()
 
         # 更新 prefix_ids 为“本轮完整 prompt 序列”
         self.prefix_ids = list(input_ids)
@@ -602,7 +641,7 @@ def setup_runtime(_model_id: Optional[str] = None) -> None:
     惰性初始化分词器、模型、Harmony 编码器与工具。
     """
 
-    global tokenizer, model, encoding, browser_tool, python_tool, model_id, cfg, _decode_token_bytes
+    global tokenizer, model, encoding, browser_tool, python_tool, model_id, cfg, _decode_token_bytes, _assistant_start_token_ids
 
     cfg = _load_config()
     if cfg.debug:
@@ -641,6 +680,14 @@ def setup_runtime(_model_id: Optional[str] = None) -> None:
     # --- Harmony 编码器 ---
     encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
     _decode_token_bytes = _build_token_byte_decoder()
+    # `<|start|>assistant` header（用于 completion prompt 末尾）；从空对话渲染即可得到稳定 token 序列。
+    try:
+        _assistant_start_token_ids = encoding.render_conversation_for_completion(
+            Conversation.from_messages([]),
+            Role.ASSISTANT,
+        )
+    except Exception:
+        _assistant_start_token_ids = [200006, 173781]  # `<|start|>`, `assistant`
 
     # --- Tools: Browser / Python ---
     exa_key = os.getenv("EXA_API_KEY")
@@ -655,7 +702,7 @@ def setup_runtime(_model_id: Optional[str] = None) -> None:
         logger.info("EXA_API_KEY not set; browser tool disabled.")
         browser_tool = None
 
-    py_impl = os.getenv("HARMONY_PYTHON_TOOL", "jupyter").strip().lower()
+    py_impl = os.getenv("PYTHON_TOOL", "jupyter").strip().lower()
     use_docker_default = (py_impl in ("", "default", "docker"))
     if use_docker_default and DockerPythonTool is not None:
         try:
@@ -757,13 +804,14 @@ def generate_assistant_once(
     assert model is not None and tokenizer is not None and encoding is not None
     assert _decode_token_bytes is not None
 
-    # 1) 渲染 Harmony prompt
-    convo = Conversation.from_messages(messages)
-    input_token_ids: List[int] = encoding.render_conversation_for_completion(convo, Role.ASSISTANT)
+    # 1) 构造 Harmony prompt（优先使用“真实 token 历史”以保持 token 级一致性）
+    if not kv_manager.history_ids:
+        # 仅用于首次初始化：后续历史以“模型实际生成的 token”+“我们追加的 tool 消息 token”为准
+        convo = Conversation.from_messages(messages)
+        kv_manager.history_ids = encoding.render_conversation(convo)
 
-    if not input_token_ids:
-        # Harmony 正常使用场景下不应该出现，留个保护
-        raise RuntimeError("Harmony renderer returned empty token sequence for non-empty conversation")
+    assert _assistant_start_token_ids is not None
+    input_token_ids: List[int] = list(kv_manager.history_ids) + list(_assistant_start_token_ids)
 
     # 2) prefill：对完整 prompt 做前向，使用 prefix cache 复用
     with torch.inference_mode():
@@ -791,13 +839,13 @@ def generate_assistant_once(
     for _ in range(max_new_tokens):
         next_id = _softmax_sample_top_p(last_logits, temperature=temperature, top_p=top_p)
 
-        # Harmony stop tokens：只作为停止条件，不写入 completion_ids
-        if next_id in stop_token_ids:
-            break
+        is_stop = next_id in stop_token_ids
 
+        # stop token 也要写入 completion_ids 并回灌模型（保证与 Harmony render 的 token 流一致，
+        # 尤其是 tool-call 末尾的 <|call|>），但不作为可见输出流。
         completion_ids.append(next_id)
 
-        if stream:
+        if stream and not is_stop:
             token_bytes = _decode_token_bytes(next_id)
             decoded = utf8_decoder.decode(token_bytes, final=False)
             if decoded:
@@ -843,6 +891,9 @@ def generate_assistant_once(
         if release_every > 0 and step % release_every == 0 and torch.cuda.is_available() and aggressive:
             _release_cuda()
 
+        if is_stop:
+            break
+
     # flush UTF-8 decoder
     if stream:
         tail = utf8_decoder.decode(b"", final=True)
@@ -860,13 +911,21 @@ def generate_assistant_once(
     if completion_ids:
         kv_manager.prefix_ids = list(input_token_ids) + list(completion_ids)
         kv_manager.stats["decode_tokens"] += len(completion_ids)
+        kv_manager.history_ids = list(kv_manager.prefix_ids)
 
     # 4) 解析生成的 completion token 为 Harmony 消息
     if not completion_ids:
         return []
 
+    # Harmony 推荐不要把 stop tokens（如 <|return|> / <|call|>）喂给 parser。
+    parse_ids = list(completion_ids)
+    while parse_ids and parse_ids[-1] in stop_token_ids:
+        parse_ids.pop()
+    if not parse_ids:
+        return []
+
     gen_msgs: List[Message] = encoding.parse_messages_from_completion_tokens(
-        completion_ids, Role.ASSISTANT
+        parse_ids, Role.ASSISTANT
     )
 
     # 生成阶段结束后的简单清理（可选）
@@ -897,9 +956,11 @@ def main() -> None:
         .with_conversation_start_date(str(date.today()))
         .with_reasoning_effort(ReasoningEffort.HIGH)
         .with_required_channels(["analysis", "commentary", "final"])
-        .with_python_tool()
-        .with_browser_tool()
     )
+    if python_tool is not None:
+        system_msg = system_msg.with_python_tool()
+    if browser_tool is not None:
+        system_msg = system_msg.with_browser_tool()
 
     developer_msg = (
         DeveloperContent.new().with_instructions(
@@ -908,7 +969,7 @@ def main() -> None:
     )
 
     user_msg = r"""
-    计算下面级数的前 1000 项和，并保留 10 位小数：
+    计算下面级数的前 1000 项和，并保留 10 位小数，尽量使用 Python 工具来计算：
     S = sum_{n=1..1000} (-1)^{n+1} / (n^2 + n)
     """
 
@@ -919,6 +980,8 @@ def main() -> None:
     ]
 
     kv_manager = KvCacheManager(model, prefill_chunk=(cfg.prefill_chunk if cfg else 128))
+    # 初始化 token 历史：从当前 messages 渲染（后续将用“真实 token 流”增量维护）
+    kv_manager.history_ids = encoding.render_conversation(Conversation.from_messages(messages))
 
     for _ in range(MAX_STEPS):
         # 1) 让模型说话（可能是 tool 调用，也可能直接给出最终答案）
@@ -957,12 +1020,14 @@ def main() -> None:
                         .with_content_type("json")
                     ]
                 messages.extend(tool_msgs)
+                for m in tool_msgs:
+                    kv_manager.history_ids.extend(encoding.render(m))
                 # 下一轮循环会基于新的 messages 继续采样
                 continue
 
             elif base == "browser":
                 if browser_tool is None:
-                    messages.append(
+                    tool_msgs = [
                         Message.from_author_and_content(
                             Author.new(Role.TOOL, "browser"),
                             json.dumps({"error": "browser tool disabled or not configured"}),
@@ -970,7 +1035,7 @@ def main() -> None:
                         .with_channel("commentary")
                         .with_recipient("assistant")
                         .with_content_type("json")
-                    )
+                    ]
                 else:
                     try:
                         tool_out = browser_tool.process(last)
@@ -986,7 +1051,10 @@ def main() -> None:
                             .with_recipient("assistant")
                             .with_content_type("json")
                         ]
-                    messages.extend(tool_msgs)
+
+                messages.extend(tool_msgs)
+                for m in tool_msgs:
+                    kv_manager.history_ids.extend(encoding.render(m))
                 continue
 
             else:
@@ -1000,6 +1068,7 @@ def main() -> None:
                     .with_recipient("assistant")
                     .with_content_type("json")
                 )
+                kv_manager.history_ids.extend(encoding.render(messages[-1]))
                 continue
 
         # 3) 若不是工具调用，则检查是否已经给出 final 消息
